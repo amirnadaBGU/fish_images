@@ -126,6 +126,9 @@ def api_save(video, frame):
         abort(404, "frame not in measure.json")
 
     recompute_record(rec, keypoints, meta)
+    if "com_x" in payload and "com_y" in payload:
+        rec["com_x"] = round(float(payload["com_x"]), 2)
+        rec["com_y"] = round(float(payload["com_y"]), 2)
     # optional: clear the problematic flag if the reviewer fixed it
     if payload.get("clear_problem"):
         rec["problematic"] = False

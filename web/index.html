@@ -77,7 +77,7 @@
     </div>
     <div class="canvas-host">
       <canvas id="cv" width="900" height="500"></canvas>
-      <div class="hint">Drag the yellow points to correct the body line. Pink = head/tail tips. Cyan ✛ = center of mass (not editable). · Mouse wheel = zoom, drag to pan when zoomed, double-click = reset zoom.</div>
+      <div class="hint">Drag yellow points to correct the body line. Pink = tips. Cyan ✛ = center of mass (drag to reposition → turns orange). · <b style="color:var(--accent)">Click</b> to add a point (constrained to fish area when mask is shown). <b style="color:#ff5cf0">Right-click</b> a point to remove it. · Mouse wheel = zoom, drag to pan, double-click = reset zoom.</div>
     </div>
   </div>
 </div>
@@ -88,6 +88,8 @@ let video=null, meta=null, frames=[], curIdx=0, rec=null;
 let img=new Image(), scale=1, keys=[], dragging=-1, dirty=false;
 let maskTinted=null, maskForName=null, maskReq=0;
 let zoom=1, panX=0, panY=0, panning=false, panLastX=0, panLastY=0;  // view transform
+let didMove=false, mousedownImgPt=null;
+let comX=null, comY=null, comDragging=false;  // CoM override (null = use rec value)
 const cv=document.getElementById("cv"), ctx=cv.getContext("2d");
 
 function clampPan(){
@@ -142,6 +144,7 @@ function selectFrame(i){
   curIdx=i; rec=frames[i]; dirty=false;
   document.getElementById("clearProb").checked=false;
   keys=(rec.keypoints||[]).map(p=>[p[0],p[1]]);
+  comX=null; comY=null;
   document.getElementById("flagTxt").textContent = rec.flags?("flags: "+rec.flags):"";
   maskTinted=null; maskForName=null;   // mask belongs to a frame; reset on change
   img=new Image();
@@ -187,12 +190,13 @@ function draw(){
     ctx.fillStyle = tip?"#ff5cf0":"#ffd23b"; ctx.fill();
     ctx.lineWidth=2*Z; ctx.strokeStyle="#04121f"; ctx.stroke();
   });
-  // center of mass (not editable)
+  // center of mass (draggable)
   if(rec && rec.com_x!=null){
-    const x=rec.com_x*scale,y=rec.com_y*scale, r=10*Z;
-    ctx.strokeStyle="#28e0e0"; ctx.lineWidth=2*Z;
-    ctx.beginPath(); ctx.moveTo(x-r,y); ctx.lineTo(x+r,y); ctx.moveTo(x,y-r); ctx.lineTo(x,y+r); ctx.stroke();
-    ctx.beginPath(); ctx.arc(x,y,5*Z,0,7); ctx.stroke();
+    const cx=(comX??rec.com_x)*scale, cy=(comY??rec.com_y)*scale, r=10*Z;
+    const edited=(comX!==null||comY!==null);
+    ctx.strokeStyle=edited?"#ff8c42":"#28e0e0"; ctx.lineWidth=2*Z;
+    ctx.beginPath(); ctx.moveTo(cx-r,cy); ctx.lineTo(cx+r,cy); ctx.moveTo(cx,cy-r); ctx.lineTo(cx,cy+r); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx,cy,5*Z,0,7); ctx.stroke();
   }
   ctx.setTransform(1,0,0,1,0,0);
 }
@@ -219,6 +223,30 @@ function loadMask(){
   m.onerror=()=>{ if(token===maskReq) toast("No mask available for this frame","err"); };
   m.src=`${API}/api/videos/${video}/frames/${name}/mask?t=${Date.now()}`;
 }
+// --- keypoint add/remove helpers ---
+function inMask(ix,iy){
+  if(!maskTinted||!rec||maskForName!==rec.name) return false;
+  const mx=Math.round(ix*(maskTinted.width/img.naturalWidth));
+  const my=Math.round(iy*(maskTinted.height/img.naturalHeight));
+  if(mx<0||my<0||mx>=maskTinted.width||my>=maskTinted.height) return false;
+  return maskTinted.getContext("2d").getImageData(mx,my,1,1).data[3]>0;
+}
+function distToSeg(p,a,b){
+  const dx=b[0]-a[0],dy=b[1]-a[1],len2=dx*dx+dy*dy;
+  if(len2===0) return Math.hypot(p[0]-a[0],p[1]-a[1]);
+  const t=Math.max(0,Math.min(1,((p[0]-a[0])*dx+(p[1]-a[1])*dy)/len2));
+  return Math.hypot(p[0]-(a[0]+t*dx),p[1]-(a[1]+t*dy));
+}
+function insertionIndex(pt,ks){
+  if(ks.length<=1) return ks.length;
+  let best=1,bd=Infinity;
+  for(let i=0;i<ks.length-1;i++){
+    const d=distToSeg(pt,ks[i],ks[i+1]);
+    if(d<bd){bd=d;best=i+1;}
+  }
+  return best;
+}
+
 document.getElementById("showMask").onchange=function(){
   if(!rec) return;
   if(this.checked){ (maskTinted && maskForName===rec.name) ? draw() : loadMask(); }
@@ -246,21 +274,53 @@ function evtPt(e){      // mouse -> image coords (undo zoom+pan, then fit scale)
   return [((cx-panX)/zoom)/scale, ((cy-panY)/zoom)/scale];
 }
 cv.addEventListener("pointerdown",e=>{
-  const [px,py]=evtPt(e); let best=-1,bd=1e9;
+  didMove=false; mousedownImgPt=evtPt(e);
+  const [px,py]=mousedownImgPt; let best=-1,bd=1e9;
   keys.forEach((p,i)=>{ const d=Math.hypot(p[0]-px,p[1]-py); if(d<bd){bd=d;best=i;} });
   if(best>=0 && bd*scale*zoom<14){ dragging=best; cv.setPointerCapture(e.pointerId); }
-  else if(zoom>1){ panning=true; panLastX=e.clientX; panLastY=e.clientY; cv.setPointerCapture(e.pointerId); cv.style.cursor="grabbing"; }
+  else if(rec&&rec.com_x!=null){
+    const dcx=Math.hypot((comX??rec.com_x)-px,(comY??rec.com_y)-py);
+    if(dcx*scale*zoom<14){ comDragging=true; cv.setPointerCapture(e.pointerId); }
+    else if(zoom>1){ panning=true; panLastX=e.clientX; panLastY=e.clientY; cv.setPointerCapture(e.pointerId); cv.style.cursor="grabbing"; }
+  } else if(zoom>1){ panning=true; panLastX=e.clientX; panLastY=e.clientY; cv.setPointerCapture(e.pointerId); cv.style.cursor="grabbing"; }
 });
 cv.addEventListener("pointermove",e=>{
   if(dragging>=0){ keys[dragging]=evtPt(e); dirty=true; draw(); updateLen(); return; }
+  if(comDragging){ const [px,py]=evtPt(e); comX=px; comY=py; dirty=true; draw(); return; }
   if(panning){
     const r=cv.getBoundingClientRect();
     panX+=(e.clientX-panLastX)*(cv.width/r.width);
     panY+=(e.clientY-panLastY)*(cv.height/r.height);
-    panLastX=e.clientX; panLastY=e.clientY; clampPan(); draw();
+    panLastX=e.clientX; panLastY=e.clientY; didMove=true; clampPan(); draw();
   }
 });
-cv.addEventListener("pointerup",()=>{ dragging=-1; panning=false; cv.style.cursor=zoom>1?"grab":"default"; });
+cv.addEventListener("pointerup",e=>{
+  const wasD=dragging>=0, wasP=panning&&didMove, wasC=comDragging;
+  dragging=-1; panning=false; comDragging=false; cv.style.cursor=zoom>1?"grab":"default";
+  if(wasC){ dirty=true; return; }
+  if(wasD||wasP||e.button!==0) return;
+  const [px,py]=evtPt(e);
+  // ignore if mouse moved significantly (treat as pan gesture at zoom=1)
+  if(mousedownImgPt&&Math.hypot(px-mousedownImgPt[0],py-mousedownImgPt[1])>10/scale) return;
+  // ignore if click was on/near an existing handle
+  let bd=1e9; keys.forEach(p=>{ const d=Math.hypot(p[0]-px,p[1]-py); if(d<bd) bd=d; });
+  if(bd*scale*zoom<18) return;
+  // if mask is loaded, constrain to fish area; otherwise allow anywhere
+  if(maskTinted&&maskForName===rec?.name){
+    if(!inMask(px,py)){ toast('Click inside the fish area to add a point','info',1500); return; }
+  }
+  keys.splice(insertionIndex([px,py],keys),0,[px,py]);
+  dirty=true; draw(); updateLen(); toast('Point added','ok',1000);
+});
+// right-click on a handle → remove it
+cv.addEventListener("contextmenu",e=>{
+  e.preventDefault();
+  const [px,py]=evtPt(e); let best=-1,bd=1e9;
+  keys.forEach((p,i)=>{ const d=Math.hypot(p[0]-px,p[1]-py); if(d<bd){bd=d;best=i;} });
+  if(best<0||bd*scale*zoom>=20) return;
+  if(keys.length<=2){ toast('Need at least 2 keypoints','err'); return; }
+  keys.splice(best,1); dirty=true; draw(); updateLen(); toast('Point removed','info',1000);
+});
 cv.addEventListener("wheel",e=>{
   e.preventDefault();
   const [mx,my]=canvasPx(e);
@@ -291,7 +351,8 @@ const saveBtn=document.getElementById("saveBtn");
 saveBtn.onclick=()=>{
   if(keys.length<2){ toast("Need at least 2 keypoints","err"); return; }
   withBusy(saveBtn,"Saving…",async()=>{
-    const body={keypoints:keys, clear_problem:document.getElementById("clearProb").checked};
+    const body={keypoints:keys, clear_problem:document.getElementById("clearProb").checked,
+                ...(comX!==null||comY!==null ? {com_x:comX??rec.com_x, com_y:comY??rec.com_y} : {})};
     const r=await fetch(`${API}/api/videos/${video}/frames/${rec.name}`,
           {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     if(!r.ok){ toast("Save failed","err"); return; }
