@@ -28,6 +28,7 @@ def recompute_record(rec: dict, keypoints, meta: dict) -> dict:
     rec["num_keypoints"] = int(len(keys))
     rec["curved_length_px"] = round(length, 2)
     rec["straight_tip_to_tip_px"] = round(straight, 2)
+    rec["bending_ratio"] = round(length / straight, 4) if straight > 0 else None
     rec["tip_tl_x"] = round(float(tl[0]), 2)
     rec["tip_tl_y"] = round(float(tl[1]), 2)
     rec["tip_br_x"] = round(float(br[0]), 2)

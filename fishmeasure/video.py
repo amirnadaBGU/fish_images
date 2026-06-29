@@ -46,6 +46,9 @@ def _result_to_record(name: str, frame_index: int, res) -> dict:
         "tip_tl_y": r(res.tip_tl_y),
         "tip_br_x": r(res.tip_br_x),
         "tip_br_y": r(res.tip_br_y),
+        "bending_ratio": round(res.curved_length_px / res.straight_tip_to_tip_px, 4)
+                         if res.straight_tip_to_tip_px and res.straight_tip_to_tip_px == res.straight_tip_to_tip_px
+                         else None,
         "keypoints": [[round(float(x), 2), round(float(y), 2)] for x, y in res.keypoints],
         "problematic": bool(res.problematic),
         "flags": ";".join(res.flags),

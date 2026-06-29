@@ -22,6 +22,7 @@ def _columns(meta: dict):
     cols += [
         ("curved length (px)", "curved_length_px"),
         ("straight length (px)", "straight_tip_to_tip_px"),
+        ("bending ratio", "bending_ratio"),
         ("center of mass x", "com_x"),
         ("center of mass y", "com_y"),
         ("tip top-left x", "tip_tl_x"),

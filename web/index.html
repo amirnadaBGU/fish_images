@@ -56,6 +56,7 @@
   <h1>🐟 Fish measurement review</h1>
   <select id="videoSel"></select>
   <span class="hint" id="vidInfo"></span>
+  <span id="vidStats" style="font-size:13px;color:var(--accent);margin-left:8px;"></span>
 </header>
 <div class="wrap">
   <div class="side" id="frameList"></div>
@@ -64,13 +65,12 @@
       <button id="prevBtn">◀ Prev</button>
       <button id="nextBtn">Next ▶</button>
       <button id="nextProbBtn">Next problem ⚠</button>
-      <span class="readout">Length: <b id="lenPx">–</b> px <span id="lenUnit"></span></span>
+      <span class="readout">Length: <b id="lenPx">–</b> px <span id="lenUnit"></span> &nbsp;·&nbsp; Bend: <b id="bendVal">–</b></span>
       <span class="flags" id="flagTxt"></span>
       <span style="flex:1"></span>
       <label class="chk"><input type="checkbox" id="showBox"> Show YOLO box</label>
       <label class="chk"><input type="checkbox" id="showMask"> Show mask</label>
       <label class="chk"><input type="checkbox" id="clearProb"> mark resolved</label>
-      <button id="addBtn">Add keypoints</button>
       <button id="resetBtn">Reset</button>
       <button class="danger" id="deleteBtn">🗑 Delete frame</button>
       <button class="primary" id="saveBtn">Save</button>
@@ -122,11 +122,27 @@ async function init(){
   else { document.getElementById("vidInfo").textContent="No videos in output/. Run measure.py first."; }
 }
 
+function updateVidInfo(){
+  const nProb=frames.filter(f=>f.problematic).length;
+  document.getElementById("vidInfo").textContent =
+    `${frames.length} frames · ${nProb} problematic · ${meta.unit||"px"}`;
+  // mean ± std of curved length for good frames
+  const good=frames.filter(f=>!f.problematic && f.curved_length_px!=null && f.curved_length_px===f.curved_length_px);
+  if(good.length>0){
+    const mean=good.reduce((s,f)=>s+f.curved_length_px,0)/good.length;
+    const std=Math.sqrt(good.reduce((s,f)=>s+(f.curved_length_px-mean)**2,0)/good.length);
+    const bend=good.filter(f=>f.bending_ratio!=null);
+    const mbend=bend.length? (bend.reduce((s,f)=>s+f.bending_ratio,0)/bend.length).toFixed(3) : "–";
+    document.getElementById("vidStats").textContent =
+      `avg length: ${mean.toFixed(0)} ± ${std.toFixed(0)} px  ·  bend: ${mbend}  (N=${good.length})`;
+  } else {
+    document.getElementById("vidStats").textContent="";
+  }
+}
+
 async function loadVideo(v){
   video=v; meta=await jget(`${API}/api/videos/${v}`); frames=meta.frames;
-  document.getElementById("vidInfo").textContent =
-    `${frames.length} frames · ${frames.filter(f=>f.problematic).length} problematic · ${meta.unit||"px"}`;
-  renderList(); selectFrame(0);
+  updateVidInfo(); renderList(); selectFrame(0);
 }
 
 function renderList(){
@@ -263,6 +279,10 @@ function updateLen(){
   document.getElementById("lenPx").textContent = keys.length>1? L.toFixed(0):"–";
   const ppu=meta&&meta.px_per_unit;
   document.getElementById("lenUnit").textContent = (ppu&&keys.length>1)? `  (${(L/ppu).toFixed(2)} ${meta.unit})`:"";
+  if(keys.length>1){
+    const straight=Math.hypot(keys[0][0]-keys[keys.length-1][0], keys[0][1]-keys[keys.length-1][1]);
+    document.getElementById("bendVal").textContent = straight>0? (L/straight).toFixed(3):"–";
+  } else { document.getElementById("bendVal").textContent="–"; }
 }
 
 function canvasPx(e){   // mouse -> canvas device pixels
@@ -341,12 +361,6 @@ document.getElementById("nextProbBtn").onclick=()=>{
   toast("No problematic frames 🎉","ok");
 };
 document.getElementById("resetBtn").onclick=()=>{ selectFrame(curIdx); toast("Reverted to saved values","info"); };
-document.getElementById("addBtn").onclick=()=>{
-  // create a default 9-point line across the middle for frames with no keypoints
-  const W=img.naturalWidth,H=img.naturalHeight,N=9,out=[];
-  for(let i=0;i<N;i++){ const t=i/(N-1); out.push([W*(0.3+0.4*t), H*(0.3+0.4*t)]); }
-  keys=out; dirty=true; draw(); updateLen(); toast("Added "+N+" keypoints — drag to position","info");
-};
 const saveBtn=document.getElementById("saveBtn");
 saveBtn.onclick=()=>{
   if(keys.length<2){ toast("Need at least 2 keypoints","err"); return; }
@@ -357,7 +371,7 @@ saveBtn.onclick=()=>{
           {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     if(!r.ok){ toast("Save failed","err"); return; }
     const updated=await r.json(); frames[curIdx]=updated; rec=updated; dirty=false;
-    renderList(); selectFrame(curIdx);
+    updateVidInfo(); renderList(); selectFrame(curIdx);
     toast(`Saved ✓  length ${updated.curved_length_px} px — Excel updated`,"ok");
   }).catch(()=>toast("Save failed","err"));
 };
@@ -370,8 +384,7 @@ deleteBtn.onclick=()=>{
     if(!r.ok){ toast("Delete failed","err"); return; }
     const res=await r.json();
     frames.splice(curIdx,1);
-    document.getElementById("vidInfo").textContent =
-      `${frames.length} frames · ${frames.filter(f=>f.problematic).length} problematic · ${meta.unit||"px"}`;
+    updateVidInfo();
     if(frames.length===0){ ctx.clearRect(0,0,cv.width,cv.height); rec=null; renderList();
       toast("Deleted — no frames left","ok"); return; }
     if(curIdx>=frames.length) curIdx=frames.length-1;
