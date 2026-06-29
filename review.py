@@ -175,6 +175,41 @@ def api_delete(video, frame):
     return jsonify({"deleted": frame, "remaining": len(meta["frames"])})
 
 
+@app.route("/api/videos/<video>/frames", methods=["DELETE"])
+def api_batch_delete(video):
+    """Delete multiple frames in one request."""
+    meta = _load_meta(video)
+    payload = request.get_json(force=True)
+    names = set(payload.get("frames", []))
+    if not names:
+        abort(400, "no frames specified")
+    meta["frames"] = [r for r in meta["frames"] if r["name"] not in names]
+    for name in names:
+        for sub in ("frames", "overlays", "masks"):
+            p = OUT_ROOT / video / sub / f"{name}.png"
+            if p.exists():
+                p.unlink()
+    _meta_path(video).write_text(json.dumps(meta, indent=2))
+    write_report(meta, OUT_ROOT / f"{video}.xlsx")
+    return jsonify({"deleted": len(names), "remaining": len(meta["frames"])})
+
+
+@app.route("/api/videos/<video>/frames/<frame>/thumb")
+def api_frame_thumb(video, frame):
+    """Return a small JPEG thumbnail (240 px wide) for the grid view."""
+    img_path = OUT_ROOT / video / "frames" / f"{frame}.png"
+    if not img_path.exists():
+        abort(404)
+    img = cv2.imread(str(img_path))
+    h, w = img.shape[:2]
+    tw = 240
+    th = int(h * tw / w)
+    thumb = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
+    _, buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    from flask import Response
+    return Response(buf.tobytes(), mimetype="image/jpeg")
+
+
 def main(argv=None):
     global OUT_ROOT, WEIGHTS, SEGMENTER, SAM_WEIGHTS
     ap = argparse.ArgumentParser(description="Fish measurement review/edit web app.")

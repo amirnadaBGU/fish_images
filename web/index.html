@@ -49,6 +49,33 @@
   #toast.ok { border-left-color:var(--good); }
   #toast.err { border-left-color:#e74c3c; }
   #toast.info { border-left-color:var(--accent); }
+  /* dashboard */
+  #dashPanel { flex:1; overflow:auto; padding:18px; display:none; }
+  .dash-row { display:flex; gap:16px; min-height:0; }
+  .dash-col { display:flex; flex-direction:column; gap:16px; flex:1; min-width:0; }
+  .dash-card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+  .dash-card h3 { margin:0 0 10px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.07em; }
+  .stat-grid { display:grid; grid-template-columns:1fr 1fr; gap:5px 20px; }
+  .stat-row { display:flex; justify-content:space-between; font-size:13px; padding:2px 0; border-bottom:1px solid var(--line); }
+  .stat-val { color:var(--accent); font-weight:600; }
+  .dash-canvas { width:100%; display:block; border-radius:4px; }
+  .heat-legend { display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:6px; }
+  button.active-view { background:#22425f; border-color:var(--accent); }
+  /* grid view */
+  #gridPanel { flex:1; overflow:auto; padding:12px; display:none; flex-direction:column; gap:10px; }
+  .grid-toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding-bottom:10px;
+                  border-bottom:1px solid var(--line); }
+  #thumbGrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:8px; }
+  .thumb-item { border:2px solid var(--line); border-radius:6px; cursor:pointer; overflow:hidden;
+                background:var(--panel); user-select:none; transition:border-color .1s; }
+  .thumb-item:hover { border-color:var(--muted); }
+  .thumb-item.selected { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .thumb-item.prob-item { border-color:#7a3a00; }
+  .thumb-item.prob-item.selected { border-color:var(--accent); }
+  .thumb-item img { width:100%; height:90px; object-fit:cover; display:block; }
+  .thumb-label { font-size:10px; padding:4px 6px; color:var(--muted);
+                 white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .thumb-len { font-weight:600; }
 </style>
 </head>
 <body>
@@ -71,9 +98,50 @@
       <label class="chk"><input type="checkbox" id="showBox"> Show YOLO box</label>
       <label class="chk"><input type="checkbox" id="showMask"> Show mask</label>
       <label class="chk"><input type="checkbox" id="clearProb"> mark resolved</label>
+      <button id="gridBtn">⊞ Grid</button>
+      <button id="dashBtn">📊 Dashboard</button>
       <button id="resetBtn">Reset</button>
       <button class="danger" id="deleteBtn">🗑 Delete frame</button>
       <button class="primary" id="saveBtn">Save</button>
+    </div>
+    <div id="gridPanel">
+      <div class="grid-toolbar">
+        <button id="selProbBtn">⚠ Select problematic</button>
+        <button id="selAllBtn">Select all</button>
+        <button id="selNoneBtn">Clear</button>
+        <span id="selCount" style="color:var(--muted);font-size:13px;">0 selected</span>
+        <button id="batchDelBtn" class="danger" disabled>🗑 Delete selected (0)</button>
+      </div>
+      <div id="thumbGrid"></div>
+    </div>
+    <div id="dashPanel">
+      <div class="dash-row">
+        <div class="dash-col" style="max-width:300px">
+          <div class="dash-card">
+            <h3>Statistics</h3>
+            <div id="statGrid" class="stat-grid"></div>
+          </div>
+          <div class="dash-card">
+            <h3>Length distribution</h3>
+            <canvas id="histCv" class="dash-canvas"></canvas>
+          </div>
+        </div>
+        <div class="dash-col" style="flex:1;min-width:0">
+          <div class="dash-card">
+            <h3>Length by position in frame</h3>
+            <canvas id="heatCv" class="dash-canvas"></canvas>
+            <div class="heat-legend" id="heatLegend"></div>
+          </div>
+          <div class="dash-card">
+            <h3 style="display:flex;align-items:center;gap:10px">
+              Length over time
+              <button id="tlModeBtn" style="font-size:11px;padding:2px 8px;border:1px solid var(--line);border-radius:4px;background:var(--bg2);cursor:pointer;font-family:inherit">⇔ uniform spacing</button>
+              <span style="font-weight:normal;font-size:11px;color:#8b98a5">(click dot → frame)</span>
+            </h3>
+            <canvas id="timelineCv" class="dash-canvas"></canvas>
+          </div>
+        </div>
+      </div>
     </div>
     <div class="canvas-host">
       <canvas id="cv" width="900" height="500"></canvas>
@@ -86,7 +154,7 @@
 const API = "";
 let video=null, meta=null, frames=[], curIdx=0, rec=null;
 let img=new Image(), scale=1, keys=[], dragging=-1, dirty=false;
-let maskTinted=null, maskForName=null, maskReq=0;
+let maskTinted=null, maskForName=null, maskReq=0, maskIsEmpty=false;
 let zoom=1, panX=0, panY=0, panning=false, panLastX=0, panLastY=0;  // view transform
 let didMove=false, mousedownImgPt=null;
 let comX=null, comY=null, comDragging=false;  // CoM override (null = use rec value)
@@ -142,7 +210,10 @@ function updateVidInfo(){
 
 async function loadVideo(v){
   video=v; meta=await jget(`${API}/api/videos/${v}`); frames=meta.frames;
-  updateVidInfo(); renderList(); selectFrame(0);
+  updateVidInfo(); renderList();
+  if(curView==="dash") renderDashboard();
+  else if(curView==="grid") { selectedFrames.clear(); renderGrid(); }
+  else selectFrame(0);
 }
 
 function renderList(){
@@ -162,7 +233,7 @@ function selectFrame(i){
   keys=(rec.keypoints||[]).map(p=>[p[0],p[1]]);
   comX=null; comY=null;
   document.getElementById("flagTxt").textContent = rec.flags?("flags: "+rec.flags):"";
-  maskTinted=null; maskForName=null;   // mask belongs to a frame; reset on change
+  maskTinted=null; maskForName=null; maskIsEmpty=false;
   img=new Image();
   img.onload=()=>{ fit(); draw(); updateLen(); if(document.getElementById("showMask").checked) loadMask(); };
   img.src=`${API}/api/videos/${video}/frames/${rec.name}?t=${Date.now()}`;
@@ -206,13 +277,18 @@ function draw(){
     ctx.fillStyle = tip?"#ff5cf0":"#ffd23b"; ctx.fill();
     ctx.lineWidth=2*Z; ctx.strokeStyle="#04121f"; ctx.stroke();
   });
-  // center of mass (draggable)
-  if(rec && rec.com_x!=null){
-    const cx=(comX??rec.com_x)*scale, cy=(comY??rec.com_y)*scale, r=10*Z;
-    const edited=(comX!==null||comY!==null);
-    ctx.strokeStyle=edited?"#ff8c42":"#28e0e0"; ctx.lineWidth=2*Z;
+  // center of mass (draggable; dashed grey = placeholder when rec.com_x is null)
+  const com=effectiveCom();
+  if(rec && com){
+    const cx=com[0]*scale, cy=com[1]*scale, r=10*Z;
+    const isPlaceholder=(rec.com_x==null&&comX==null);
+    const isEdited=(comX!==null||comY!==null);
+    ctx.strokeStyle=isPlaceholder?"#8b98a5":isEdited?"#ff8c42":"#28e0e0";
+    ctx.lineWidth=2*Z;
+    if(isPlaceholder) ctx.setLineDash([4*Z,3*Z]);
     ctx.beginPath(); ctx.moveTo(cx-r,cy); ctx.lineTo(cx+r,cy); ctx.moveTo(cx,cy-r); ctx.lineTo(cx,cy+r); ctx.stroke();
     ctx.beginPath(); ctx.arc(cx,cy,5*Z,0,7); ctx.stroke();
+    if(isPlaceholder) ctx.setLineDash([]);
   }
   ctx.setTransform(1,0,0,1,0,0);
 }
@@ -229,16 +305,29 @@ function loadMask(){
     const oc=document.createElement("canvas"); oc.width=m.naturalWidth; oc.height=m.naturalHeight;
     const octx=oc.getContext("2d"); octx.drawImage(m,0,0);
     const d=octx.getImageData(0,0,oc.width,oc.height), a=d.data;
+    let hasContent=false;
     for(let i=0;i<a.length;i+=4){
-      if(a[i]>127){ a[i]=0; a[i+1]=230; a[i+2]=0; a[i+3]=120; } else { a[i+3]=0; }
+      if(a[i]>127){ a[i]=0; a[i+1]=230; a[i+2]=0; a[i+3]=120; hasContent=true; } else { a[i+3]=0; }
     }
     octx.putImageData(d,0,0);
-    maskTinted=oc; maskForName=name; draw();
+    maskTinted=oc; maskForName=name; maskIsEmpty=!hasContent; draw();
     if(rec && rec.name===name) toast("Mask shown","ok",1000);
   };
   m.onerror=()=>{ if(token===maskReq) toast("No mask available for this frame","err"); };
   m.src=`${API}/api/videos/${video}/frames/${name}/mask?t=${Date.now()}`;
 }
+// returns effective CoM [x,y] in image coords, or null
+function effectiveCom(){
+  const cx=comX??rec?.com_x, cy=comY??rec?.com_y;
+  if(cx!=null) return [cx,cy];
+  // placeholder: centroid of current keypoints
+  if(keys.length>=2){
+    return [keys.reduce((s,p)=>s+p[0],0)/keys.length,
+            keys.reduce((s,p)=>s+p[1],0)/keys.length];
+  }
+  return null;
+}
+
 // --- keypoint add/remove helpers ---
 function inMask(ix,iy){
   if(!maskTinted||!rec||maskForName!==rec.name) return false;
@@ -298,11 +387,12 @@ cv.addEventListener("pointerdown",e=>{
   const [px,py]=mousedownImgPt; let best=-1,bd=1e9;
   keys.forEach((p,i)=>{ const d=Math.hypot(p[0]-px,p[1]-py); if(d<bd){bd=d;best=i;} });
   if(best>=0 && bd*scale*zoom<14){ dragging=best; cv.setPointerCapture(e.pointerId); }
-  else if(rec&&rec.com_x!=null){
-    const dcx=Math.hypot((comX??rec.com_x)-px,(comY??rec.com_y)-py);
-    if(dcx*scale*zoom<14){ comDragging=true; cv.setPointerCapture(e.pointerId); }
-    else if(zoom>1){ panning=true; panLastX=e.clientX; panLastY=e.clientY; cv.setPointerCapture(e.pointerId); cv.style.cursor="grabbing"; }
-  } else if(zoom>1){ panning=true; panLastX=e.clientX; panLastY=e.clientY; cv.setPointerCapture(e.pointerId); cv.style.cursor="grabbing"; }
+  else {
+    const com=effectiveCom();
+    if(com&&Math.hypot(com[0]-px,com[1]-py)*scale*zoom<14){
+      comDragging=true; cv.setPointerCapture(e.pointerId);
+    } else if(zoom>1){ panning=true; panLastX=e.clientX; panLastY=e.clientY; cv.setPointerCapture(e.pointerId); cv.style.cursor="grabbing"; }
+  }
 });
 cv.addEventListener("pointermove",e=>{
   if(dragging>=0){ keys[dragging]=evtPt(e); dirty=true; draw(); updateLen(); return; }
@@ -326,7 +416,7 @@ cv.addEventListener("pointerup",e=>{
   let bd=1e9; keys.forEach(p=>{ const d=Math.hypot(p[0]-px,p[1]-py); if(d<bd) bd=d; });
   if(bd*scale*zoom<18) return;
   // if mask is loaded, constrain to fish area; otherwise allow anywhere
-  if(maskTinted&&maskForName===rec?.name){
+  if(maskTinted&&maskForName===rec?.name&&!maskIsEmpty){
     if(!inMask(px,py)){ toast('Click inside the fish area to add a point','info',1500); return; }
   }
   keys.splice(insertionIndex([px,py],keys),0,[px,py]);
@@ -385,10 +475,11 @@ deleteBtn.onclick=()=>{
     const res=await r.json();
     frames.splice(curIdx,1);
     updateVidInfo();
+    if(curView==="dash") renderDashboard();
     if(frames.length===0){ ctx.clearRect(0,0,cv.width,cv.height); rec=null; renderList();
       toast("Deleted — no frames left","ok"); return; }
     if(curIdx>=frames.length) curIdx=frames.length-1;
-    dirty=false; renderList(); selectFrame(curIdx);
+    dirty=false; renderList(); if(curView==="review") selectFrame(curIdx);
     toast(`Deleted ✓  ${res.remaining} frames left — Excel updated`,"ok");
   }).catch(()=>toast("Delete failed","err"));
 };
@@ -397,6 +488,490 @@ window.addEventListener("keydown",e=>{
   if(e.key==="ArrowRight") document.getElementById("nextBtn").click();
   if(e.key==="s"&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); document.getElementById("saveBtn").click(); }
 });
+// ── View switching ────────────────────────────────────────────────────────────
+let curView = "review"; // "review" | "dash" | "grid"
+function setView(v) {
+  curView = v;
+  document.querySelector(".canvas-host").style.display = v==="review" ? "block" : "none";
+  document.getElementById("dashPanel").style.display  = v==="dash"   ? "block" : "none";
+  document.getElementById("gridPanel").style.display  = v==="grid"   ? "flex"  : "none";
+  document.getElementById("dashBtn").classList.toggle("active-view", v==="dash");
+  document.getElementById("gridBtn").classList.toggle("active-view", v==="grid");
+  document.getElementById("dashBtn").textContent = v==="dash" ? "← Review" : "📊 Dashboard";
+  document.getElementById("gridBtn").textContent = v==="grid" ? "← Review" : "⊞ Grid";
+  if (v==="dash" && video) renderDashboard();
+  if (v==="grid" && video) { selectedFrames.clear(); renderGrid(); }
+  if (v==="review" && frames.length > 0) selectFrame(curIdx);
+}
+document.getElementById("dashBtn").onclick = () => setView(curView==="dash" ? "review" : "dash");
+document.getElementById("gridBtn").onclick  = () => setView(curView==="grid" ? "review" : "grid");
+
+// ── Grid view ─────────────────────────────────────────────────────────────────
+let selectedFrames = new Set();
+
+function renderGrid() {
+  const grid = document.getElementById("thumbGrid");
+  grid.innerHTML = frames.map(f => {
+    const sel  = selectedFrames.has(f.name) ? "selected" : "";
+    const prob = f.problematic ? "prob-item" : "";
+    const lenTxt = f.curved_length_px!=null ? f.curved_length_px.toFixed(0)+" px" : "–";
+    const lenCol = f.problematic ? "color:var(--warn)" : "color:var(--accent)";
+    return `<div class="thumb-item ${sel} ${prob}" data-name="${f.name}">
+      <img src="${API}/api/videos/${video}/frames/${f.name}/thumb" loading="lazy">
+      <div class="thumb-label">${f.name}<br><span class="thumb-len" style="${lenCol}">${lenTxt}</span></div>
+    </div>`;
+  }).join("");
+  grid.querySelectorAll(".thumb-item").forEach((el, i) => {
+    el.addEventListener("click", () => toggleThumb(el.dataset.name));
+    el.addEventListener("dblclick", () => { curIdx=i; setView("review"); });
+  });
+  updateSelCount();
+}
+
+function toggleThumb(name) {
+  if (selectedFrames.has(name)) selectedFrames.delete(name);
+  else selectedFrames.add(name);
+  document.querySelector(`.thumb-item[data-name="${name}"]`)
+          ?.classList.toggle("selected", selectedFrames.has(name));
+  updateSelCount();
+}
+
+function updateSelCount() {
+  const n = selectedFrames.size;
+  document.getElementById("selCount").textContent = `${n} selected`;
+  const btn = document.getElementById("batchDelBtn");
+  btn.textContent = `🗑 Delete selected (${n})`;
+  btn.disabled = n === 0;
+}
+
+document.getElementById("selProbBtn").onclick = () => {
+  frames.filter(f => f.problematic).forEach(f => selectedFrames.add(f.name));
+  renderGrid();
+};
+document.getElementById("selAllBtn").onclick = () => {
+  frames.forEach(f => selectedFrames.add(f.name));
+  renderGrid();
+};
+document.getElementById("selNoneBtn").onclick = () => {
+  selectedFrames.clear(); renderGrid();
+};
+
+const batchDelBtn = document.getElementById("batchDelBtn");
+batchDelBtn.onclick = () => {
+  const n = selectedFrames.size;
+  if (!n) return;
+  if (!confirm(`Delete ${n} frame(s)?\nThis removes their images and rows from the Excel.`)) return;
+  withBusy(batchDelBtn, "Deleting…", async () => {
+    const r = await fetch(`${API}/api/videos/${video}/frames`,
+      { method:"DELETE", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({frames: [...selectedFrames]}) });
+    if (!r.ok) { toast("Batch delete failed","err"); return; }
+    const res = await r.json();
+    // remove from local frames array
+    const deleted = new Set(selectedFrames);
+    frames = frames.filter(f => !deleted.has(f.name));
+    meta.frames = frames;
+    selectedFrames.clear();
+    updateVidInfo();
+    if (curView==="dash") renderDashboard();
+    renderGrid();
+    // reset review state
+    curIdx = Math.min(curIdx, frames.length-1);
+    if (frames.length > 0) { rec = frames[curIdx]; }
+    else { rec = null; ctx.clearRect(0,0,cv.width,cv.height); }
+    toast(`Deleted ${res.deleted} frame(s) — ${res.remaining} remaining, Excel updated`, "ok", 3000);
+  }).catch(() => toast("Batch delete failed","err"));
+};
+
+// ── Dashboard ────────────────────────────────────────────────────────────────
+
+function computeStats(good) {
+  if (!good.length) return null;
+  const lens = good.map(f => f.curved_length_px);
+  const n = lens.length;
+  const mean = lens.reduce((s,v) => s+v, 0) / n;
+  const std  = Math.sqrt(lens.reduce((s,v) => s+(v-mean)**2, 0) / n);
+  const sorted = [...lens].sort((a,b) => a-b);
+  const median = n%2 ? sorted[(n-1)/2] : (sorted[n/2-1]+sorted[n/2])/2;
+  const bends = good.filter(f => f.bending_ratio!=null).map(f => f.bending_ratio);
+  const meanBend = bends.length ? bends.reduce((s,v)=>s+v,0)/bends.length : null;
+  return { n, mean, std, median, min:sorted[0], max:sorted[n-1], meanBend };
+}
+
+function lenColor(t) {
+  return `hsl(${(1-t)*220},90%,55%)`;  // blue→cyan→green→yellow→red
+}
+
+function renderDashboard() {
+  const good = frames.filter(f => !f.problematic && f.curved_length_px!=null && f.curved_length_px===f.curved_length_px);
+  const nProb = frames.filter(f => f.problematic).length;
+  const stats = computeStats(good);
+  const sg = document.getElementById("statGrid");
+  if (!stats) { sg.innerHTML='<span style="color:var(--muted)">No good frames</span>'; return; }
+  sg.innerHTML = [
+    ["Total frames", frames.length],
+    ["Good frames",  good.length],
+    ["Problematic",  nProb],
+    ["Mean length",  stats.mean.toFixed(1)+" px"],
+    ["Std dev",      stats.std.toFixed(1)+" px"],
+    ["CV",           (stats.std/stats.mean*100).toFixed(1)+"%"],
+    ["Median",       stats.median.toFixed(1)+" px"],
+    ["Min",          stats.min.toFixed(1)+" px"],
+    ["Max",          stats.max.toFixed(1)+" px"],
+    ["Range",        (stats.max-stats.min).toFixed(1)+" px"],
+    ["Avg bend",     stats.meanBend!=null? stats.meanBend.toFixed(4):"–"],
+  ].map(([k,v])=>`<span class="stat-row"><span>${k}</span><span class="stat-val">${v}</span></span>`).join("");
+
+  const histCv     = document.getElementById("histCv");
+  const heatCv     = document.getElementById("heatCv");
+  const timelineCv = document.getElementById("timelineCv");
+  const histW = histCv.parentElement.clientWidth - 28;
+  const heatW = heatCv.parentElement.clientWidth - 28;
+  const tlW   = timelineCv.parentElement.clientWidth - 28 || heatW;
+  histCv.width = histW;         histCv.height = 180;
+  heatCv.width = heatW;         heatCv.height = Math.round(heatW * 0.45);
+  timelineCv.width = tlW;       timelineCv.height = 150;
+
+  drawHistogram(histCv, good.map(f=>f.curved_length_px), stats);
+  drawHeatmap(heatCv, good);
+  drawTimeline(timelineCv, frames);   // all frames (incl. problematic)
+}
+
+function drawHistogram(canvas, lens, stats) {
+  const W=canvas.width, H=canvas.height;
+  const c=canvas.getContext("2d");
+  c.fillStyle="#0a1018"; c.fillRect(0,0,W,H);
+  const BINS=20, mn=stats.min, mx=stats.max, span=mx-mn||1;
+  const bw=span/BINS, counts=new Array(BINS).fill(0);
+  lens.forEach(v=>{ const b=Math.min(BINS-1,Math.floor((v-mn)/bw)); counts[b]++; });
+  const maxC=Math.max(...counts)||1;
+  const pad={l:38,r:10,t:14,b:28}, pw=W-pad.l-pad.r, ph=H-pad.t-pad.b;
+
+  // ±1 std shading
+  const sx1=pad.l+Math.max(0,(stats.mean-stats.std-mn)/span)*pw;
+  const sx2=pad.l+Math.min(1,(stats.mean+stats.std-mn)/span)*pw;
+  c.fillStyle="rgba(47,191,113,.12)"; c.fillRect(sx1,pad.t,sx2-sx1,ph);
+
+  // bars
+  counts.forEach((ct,i)=>{
+    const x=pad.l+(i/BINS)*pw, bpw=pw/BINS-1, bph=(ct/maxC)*ph;
+    const t=i/(BINS-1);
+    c.fillStyle=`hsla(${(1-t)*220},80%,55%,.55)`; c.fillRect(x,pad.t+ph-bph,bpw,bph);
+    c.strokeStyle=`hsl(${(1-t)*220},80%,55%)`; c.lineWidth=1; c.strokeRect(x,pad.t+ph-bph,bpw,bph);
+  });
+
+  // mean line
+  const mx2=pad.l+((stats.mean-mn)/span)*pw;
+  c.strokeStyle="#2fbf71"; c.lineWidth=2; c.setLineDash([5,4]);
+  c.beginPath(); c.moveTo(mx2,pad.t); c.lineTo(mx2,pad.t+ph); c.stroke(); c.setLineDash([]);
+  c.fillStyle="#2fbf71"; c.font="10px system-ui"; c.textAlign="left";
+  c.fillText("μ="+stats.mean.toFixed(0), Math.min(mx2+3,W-50), pad.t+10);
+
+  // axes
+  c.strokeStyle="#26323f"; c.lineWidth=1;
+  c.beginPath(); c.moveTo(pad.l,pad.t); c.lineTo(pad.l,pad.t+ph);
+                 c.moveTo(pad.l,pad.t+ph); c.lineTo(pad.l+pw,pad.t+ph); c.stroke();
+  c.fillStyle="#8b98a5"; c.font="10px system-ui"; c.textAlign="center";
+  [0,.25,.5,.75,1].forEach(t=>{ c.fillText((mn+t*span).toFixed(0), pad.l+t*pw, H-5); });
+  c.textAlign="right";
+  [0,.5,1].forEach(t=>{ c.fillText(Math.round(t*maxC), pad.l-3, pad.t+(1-t)*ph+3); });
+}
+
+let _heatDots = [];  // [{x, y, frameIdx}] in canvas coords, rebuilt each render
+let _heatSnapshot = null, _timelineSnapshot = null, _hoveredFrameName = null;
+
+function _canvasPt(e) {
+  const r=e.currentTarget.getBoundingClientRect();
+  return [(e.clientX-r.left)*e.currentTarget.width/r.width,
+          (e.clientY-r.top)*e.currentTarget.height/r.height];
+}
+
+function _ptSegDist(px,py,ax,ay,bx,by){
+  const dx=bx-ax,dy=by-ay,len2=dx*dx+dy*dy;
+  if(len2===0) return Math.hypot(px-ax,py-ay);
+  const t=Math.max(0,Math.min(1,((px-ax)*dx+(py-ay)*dy)/len2));
+  return Math.hypot(px-(ax+t*dx),py-(ay+t*dy));
+}
+function _nearestDot(dots, cx, cy, maxD) {
+  let best=null, bestD=Infinity;
+  dots.forEach(d=>{
+    const d2=(d.x1!=null) ? _ptSegDist(cx,cy,d.x1,d.y1,d.x2,d.y2) : Math.hypot(d.x-cx,d.y-cy);
+    if(d2<bestD){bestD=d2;best=d;}
+  });
+  return bestD<=maxD ? best : null;
+}
+
+function _drawHighlight(ctx, x, y, color, label) {
+  // outer glow ring
+  ctx.beginPath(); ctx.arc(x,y,10,0,Math.PI*2);
+  ctx.strokeStyle="rgba(255,255,255,.9)"; ctx.lineWidth=3; ctx.stroke();
+  ctx.beginPath(); ctx.arc(x,y,10,0,Math.PI*2);
+  ctx.strokeStyle=color; ctx.lineWidth=2; ctx.stroke();
+  // filled centre
+  ctx.beginPath(); ctx.arc(x,y,5,0,Math.PI*2);
+  ctx.fillStyle=color; ctx.fill();
+  // tooltip
+  if(label){
+    ctx.font="bold 11px system-ui";
+    const tw=ctx.measureText(label).width, pad=5;
+    let lx=x+14, ly=y-6;
+    if(lx+tw+pad*2>ctx.canvas.width) lx=x-tw-pad*2-6;
+    ctx.fillStyle="rgba(20,20,30,.82)";
+    ctx.beginPath();
+    ctx.rect(lx-pad,ly-12,tw+pad*2,17);
+    ctx.fill();
+    ctx.fillStyle="#fff"; ctx.textAlign="left"; ctx.textBaseline="alphabetic";
+    ctx.fillText(label,lx,ly);
+  }
+}
+
+function _applyHover(name) {
+  if(_hoveredFrameName===name) return;
+  _hoveredFrameName=name;
+  const heatCv=document.getElementById("heatCv");
+  const tlCv=document.getElementById("timelineCv");
+  const hc=heatCv.getContext("2d"), tc=tlCv.getContext("2d");
+  if(_heatSnapshot) hc.putImageData(_heatSnapshot,0,0);
+  if(_timelineSnapshot) tc.putImageData(_timelineSnapshot,0,0);
+  if(!name) return;
+  const hd=_heatDots.find(d=>d.name===name);
+  if(hd&&_heatSnapshot){
+    if(hd.x1!=null) _drawArrowHighlight(hc,hd.x1,hd.y1,hd.x2,hd.y2,hd.color,`${hd.len?.toFixed(0)} px`);
+    else _drawHighlight(hc,hd.x,hd.y,"#ff8c42",`${hd.len?.toFixed(0)} px`);
+  }
+  const td=_timelineDots.find(d=>d.name===name);
+  if(td&&_timelineSnapshot){
+    const col=td.prob?"#e05a5a":td.outlier?"#e0855a":"#5a8fe0";
+    _drawHighlight(tc,td.x,td.y,col,td.val!=null?`${td.val.toFixed(0)} px`:"problem");
+  }
+}
+
+function _arrow(ctx, x1, y1, x2, y2, color, lw, alpha) {
+  const dx=x2-x1, dy=y2-y1, len=Math.hypot(dx,dy);
+  if(len<1) return;
+  const hl=Math.min(7,len*0.35), ang=Math.atan2(dy,dx);
+  ctx.globalAlpha=alpha??0.82; ctx.strokeStyle=color; ctx.lineWidth=lw??1.5;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x2,y2);
+  ctx.lineTo(x2-hl*Math.cos(ang-Math.PI/5),y2-hl*Math.sin(ang-Math.PI/5));
+  ctx.lineTo(x2-hl*Math.cos(ang+Math.PI/5),y2-hl*Math.sin(ang+Math.PI/5));
+  ctx.closePath(); ctx.fillStyle=color; ctx.fill();
+  ctx.globalAlpha=1;
+}
+
+function _drawArrowHighlight(ctx, x1, y1, x2, y2, color, label) {
+  // white halo
+  _arrow(ctx,x1,y1,x2,y2,"white",5,0.9);
+  // colored arrow on top
+  _arrow(ctx,x1,y1,x2,y2,color,2.5,1);
+  // tooltip at midpoint
+  if(label) _drawHighlight(ctx,(x1+x2)/2,(y1+y2)/2,color,label);
+}
+
+function drawHeatmap(canvas, good) {
+  const W=canvas.width, H=canvas.height;
+  const c=canvas.getContext("2d");
+  c.fillStyle="#ffffff"; c.fillRect(0,0,W,H);
+  const pts=good.filter(f=>f.com_x!=null&&f.com_y!=null);
+  _heatDots=[];
+  if(!pts.length){ c.fillStyle="#8b98a5"; c.font="13px system-ui"; c.textAlign="center";
+    c.fillText("No position data",W/2,H/2); return; }
+
+  const allX=[...pts.map(f=>f.com_x),...pts.filter(f=>f.tip_tl_x!=null).flatMap(f=>[f.tip_tl_x,f.tip_br_x])];
+  const allY=[...pts.map(f=>f.com_y),...pts.filter(f=>f.tip_tl_y!=null).flatMap(f=>[f.tip_tl_y,f.tip_br_y])];
+  const imgW=img.naturalWidth||Math.max(...allX)*1.1;
+  const imgH=img.naturalHeight||Math.max(...allY)*1.1;
+  const lens=pts.map(f=>f.curved_length_px), minL=Math.min(...lens), maxL=Math.max(...lens), spanL=maxL-minL||1;
+  const pad={l:4,r:4,t:4,b:4}, pw=W-pad.l-pad.r, ph=H-pad.t-pad.b;
+  const sx=f=>pad.l+(f/imgW)*pw, sy=f=>pad.t+(f/imgH)*ph;
+
+  pts.forEach(f=>{
+    const t=(f.curved_length_px-minL)/spanL;
+    const col=lenColor(t);
+    const frameIdx=frames.findIndex(r=>r.name===f.name);
+    const hasTips=f.tip_tl_x!=null&&f.tip_br_x!=null;
+    if(hasTips){
+      // fixed-length arrow (14px) centered at midpoint, direction from tip_br→tip_tl
+      const fx1=sx(f.tip_br_x),fy1=sy(f.tip_br_y);
+      const fx2=sx(f.tip_tl_x),fy2=sy(f.tip_tl_y);
+      const xm=(fx1+fx2)/2, ym=(fy1+fy2)/2;
+      const flen=Math.hypot(fx2-fx1,fy2-fy1)||1;
+      const ux=(fx2-fx1)/flen, uy=(fy2-fy1)/flen;
+      const HS=9; // half-length of drawn arrow
+      const x1=xm-ux*HS, y1=ym-uy*HS, x2=xm+ux*HS, y2=ym+uy*HS;
+      _arrow(c,x1,y1,x2,y2,col,2.5);
+      _heatDots.push({x:xm,y:ym,x1,y1,x2,y2,color:col,frameIdx,name:f.name,len:f.curved_length_px});
+    } else {
+      // fallback dot at CoM
+      const x=sx(f.com_x),y=sy(f.com_y);
+      c.beginPath(); c.arc(x,y,4,0,Math.PI*2);
+      c.fillStyle=col; c.globalAlpha=.82; c.fill(); c.globalAlpha=1;
+      _heatDots.push({x,y,x1:null,color:col,frameIdx,name:f.name,len:f.curved_length_px});
+    }
+  });
+  // color legend gradient bar
+  const lx=pad.l, ly=H-18, lw=Math.min(180,pw), lh=8;
+  const grad=c.createLinearGradient(lx,0,lx+lw,0);
+  grad.addColorStop(0,lenColor(0)); grad.addColorStop(1,lenColor(1));
+  c.fillStyle=grad; c.fillRect(lx,ly,lw,lh);
+  c.fillStyle="#444"; c.font="10px system-ui"; c.textAlign="left";
+  c.fillText(minL.toFixed(0)+" px",lx,ly+lh+10);
+  c.textAlign="right"; c.fillText(maxL.toFixed(0)+" px",lx+lw,ly+lh+10);
+  document.getElementById("heatLegend").innerHTML="";
+  _heatSnapshot=canvas.getContext("2d").getImageData(0,0,canvas.width,canvas.height);
+  _hoveredFrameName=null;
+}
+
+document.getElementById("heatCv").addEventListener("mousemove", e=>{
+  if(!_heatDots.length) return;
+  const [cx,cy]=_canvasPt(e);
+  const d=_nearestDot(_heatDots,cx,cy,14);
+  e.currentTarget.style.cursor=d?"pointer":"default";
+  _applyHover(d?d.name:null);
+});
+document.getElementById("heatCv").addEventListener("mouseleave", ()=>_applyHover(null));
+
+// click on a heatmap dot -> navigate to that frame
+document.getElementById("heatCv").addEventListener("click", e=>{
+  if(!_heatDots.length) return;
+  const r=e.currentTarget.getBoundingClientRect();
+  const mx=e.clientX-r.left, my=e.clientY-r.top;
+  // scale from display px to canvas px
+  const sx=e.currentTarget.width/r.width, sy=e.currentTarget.height/r.height;
+  const cx=mx*sx, cy=my*sy;
+  let best=null, bestD=Infinity;
+  _heatDots.forEach(d=>{
+    const d2=Math.hypot(d.x-cx,d.y-cy);
+    if(d2<bestD){ bestD=d2; best=d; }
+  });
+  if(best && bestD<=14 && best.frameIdx>=0){
+    curIdx=best.frameIdx;
+    setView("review");
+  }
+});
+// ── Timeline ─────────────────────────────────────────────────────────────────
+let _timelineDots = [];  // [{x, y, frameIdx, prob}]
+let timelineMode = 'uniform';  // 'uniform' | 'real'
+
+document.getElementById("tlModeBtn").onclick = ()=>{
+  timelineMode = timelineMode==='uniform' ? 'real' : 'uniform';
+  document.getElementById("tlModeBtn").textContent =
+    timelineMode==='uniform' ? '⇔ uniform spacing' : '⇔ real spacing';
+  renderDashboard();
+};
+
+function _frameNum(name){ return parseInt(name.replace(/\D/g,''))||0; }
+
+function drawTimeline(canvas, allFrames) {
+  const W=canvas.width, H=canvas.height;
+  const c=canvas.getContext("2d");
+  c.fillStyle="#ffffff"; c.fillRect(0,0,W,H);
+  _timelineDots=[];
+  if(!allFrames.length) return;
+
+  const pad={l:42,r:12,t:12,b:28};
+  const pw=W-pad.l-pad.r, ph=H-pad.t-pad.b;
+
+  // x position: uniform (array index) or real (frame number)
+  const nums = timelineMode==='real' ? allFrames.map(f=>_frameNum(f.name)) : allFrames.map((_,i)=>i);
+  const minN=Math.min(...nums), maxN=Math.max(...nums), spanN=maxN-minN||1;
+  const xPos = i => pad.l + ((nums[i]-minN)/spanN)*pw;
+
+  // gather values (null for problematic)
+  const vals=allFrames.map(f=>(!f.problematic && f.curved_length_px!=null) ? f.curved_length_px : null);
+  const good=vals.filter(v=>v!=null);
+  if(!good.length){ c.fillStyle="#8b98a5"; c.font="13px system-ui"; c.textAlign="center"; c.fillText("No data",W/2,H/2); return; }
+
+  const minV=Math.min(...good), maxV=Math.max(...good);
+  const span=maxV-minV||1;
+  const mean=good.reduce((a,b)=>a+b,0)/good.length;
+  const std=Math.sqrt(good.reduce((s,v)=>s+(v-mean)**2,0)/good.length);
+
+  // mean ± std band
+  const yMean=pad.t+ph*(1-(mean-minV)/span);
+  const yHi  =pad.t+ph*(1-(Math.min(mean+std,maxV)-minV)/span);
+  const yLo  =pad.t+ph*(1-(Math.max(mean-std,minV)-minV)/span);
+  c.fillStyle="rgba(82,140,230,.1)"; c.fillRect(pad.l,yHi,pw,yLo-yHi);
+  c.strokeStyle="rgba(82,140,230,.4)"; c.lineWidth=1; c.setLineDash([4,3]);
+  c.beginPath(); c.moveTo(pad.l,yMean); c.lineTo(pad.l+pw,yMean); c.stroke();
+  c.setLineDash([]);
+
+  // connecting line (good frames only — skip gaps)
+  c.strokeStyle="#5a8fe0"; c.lineWidth=1.5;
+  c.beginPath(); let started=false;
+  allFrames.forEach((f,i)=>{
+    if(vals[i]==null){ started=false; return; }
+    const x=xPos(i);
+    const y=pad.t+ph*(1-(vals[i]-minV)/span);
+    if(!started){ c.moveTo(x,y); started=true; } else c.lineTo(x,y);
+  });
+  c.stroke();
+
+  // dots
+  allFrames.forEach((f,i)=>{
+    const x=xPos(i);
+    const isProb=f.problematic;
+    const v=vals[i];
+    const y=isProb ? pad.t+ph+10 : pad.t+ph*(1-(v-minV)/span);  // prob dots below axis
+    const isOutlier = v!=null && Math.abs(v-mean)>2*std;
+    _timelineDots.push({x, y: isProb ? pad.t+ph+2 : y, frameIdx:i, prob:isProb, outlier:isOutlier, name:f.name, val:v});
+    if(isProb){
+      // small red X below axis
+      c.strokeStyle="#e05a5a"; c.lineWidth=1.5;
+      const r=4, xp=x, yp=pad.t+ph+8;
+      c.beginPath(); c.moveTo(xp-r,yp-r); c.lineTo(xp+r,yp+r); c.moveTo(xp+r,yp-r); c.lineTo(xp-r,yp+r); c.stroke();
+    } else {
+      c.beginPath(); c.arc(x,y,isOutlier?5:3.5,0,Math.PI*2);
+      c.fillStyle=isOutlier?"#e0855a":"#5a8fe0"; c.fill();
+      if(isOutlier){ c.strokeStyle="rgba(0,0,0,.3)"; c.lineWidth=.8; c.stroke(); }
+    }
+  });
+
+  // Y axis labels
+  c.fillStyle="#8b98a5"; c.font="10px system-ui"; c.textAlign="right";
+  [0,.5,1].forEach(t=>{
+    const v=minV+t*span, y=pad.t+ph*(1-t);
+    c.fillText(v.toFixed(0),pad.l-5,y+3);
+    c.strokeStyle="rgba(0,0,0,.07)"; c.lineWidth=1;
+    c.beginPath(); c.moveTo(pad.l,y); c.lineTo(pad.l+pw,y); c.stroke();
+  });
+
+  // legend
+  c.fillStyle="#5a8fe0"; c.font="10px system-ui"; c.textAlign="left";
+  c.fillText("● good",pad.l,H-6);
+  c.fillStyle="#e05a5a"; c.fillText("× problem",pad.l+55,H-6);
+  c.fillStyle="#e0855a"; c.fillText("● outlier (>2σ)",pad.l+120,H-6);
+  _timelineSnapshot=canvas.getContext("2d").getImageData(0,0,canvas.width,canvas.height);
+  _hoveredFrameName=null;
+}
+
+document.getElementById("timelineCv").addEventListener("mousemove", e=>{
+  if(!_timelineDots.length) return;
+  const [cx,cy]=_canvasPt(e);
+  const d=_nearestDot(_timelineDots,cx,cy,12);
+  e.currentTarget.style.cursor=d?"pointer":"default";
+  _applyHover(d?d.name:null);
+});
+document.getElementById("timelineCv").addEventListener("mouseleave", ()=>_applyHover(null));
+
+document.getElementById("timelineCv").addEventListener("click", e=>{
+  if(!_timelineDots.length) return;
+  const r=e.currentTarget.getBoundingClientRect();
+  const sx=e.currentTarget.width/r.width, sy=e.currentTarget.height/r.height;
+  const cx=(e.clientX-r.left)*sx, cy=(e.clientY-r.top)*sy;
+  let best=null, bestD=Infinity;
+  _timelineDots.forEach(d=>{
+    const d2=Math.hypot(d.x-cx,d.y-cy);
+    if(d2<bestD){ bestD=d2; best=d; }
+  });
+  if(best && bestD<=12 && best.frameIdx>=0){
+    curIdx=best.frameIdx;
+    setView("review");
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 init();
 </script>
 </body>
