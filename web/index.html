@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fish measurement review</title>
+<style>
+  :root { --bg:#0f1620; --panel:#17202b; --line:#26323f; --txt:#e6edf3; --muted:#8b98a5;
+          --accent:#3b9eff; --warn:#ff8c42; --good:#2fbf71; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line);
+           display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  select, button { background:#1f2a37; color:var(--txt); border:1px solid var(--line);
+           border-radius:6px; padding:6px 10px; font-size:13px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#04121f; font-weight:600; }
+  button:disabled { opacity:.4; cursor:default; }
+  .wrap { display:flex; height:calc(100vh - 53px); }
+  .side { width:230px; background:var(--panel); border-right:1px solid var(--line); overflow:auto; flex:none; }
+  .frame-item { padding:8px 12px; border-bottom:1px solid var(--line); cursor:pointer; display:flex;
+           justify-content:space-between; gap:8px; align-items:center; }
+  .frame-item:hover { background:#1d2733; }
+  .frame-item.active { background:#22425f; }
+  .frame-item .nm { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .badge { font-size:10px; padding:1px 6px; border-radius:10px; flex:none; }
+  .badge.prob { background:var(--warn); color:#1a0d00; }
+  .badge.edit { background:var(--good); color:#04140b; }
+  .main { flex:1; display:flex; flex-direction:column; overflow:auto; }
+  .toolbar { padding:10px 16px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+           border-bottom:1px solid var(--line); }
+  .readout { font-size:15px; }
+  .readout b { color:var(--accent); font-size:18px; }
+  .flags { color:var(--warn); font-size:12px; }
+  .canvas-host { flex:1; overflow:auto; padding:16px; }
+  canvas { background:#000; border:1px solid var(--line); border-radius:6px; max-width:100%; touch-action:none; }
+  .hint { color:var(--muted); font-size:12px; }
+  label.chk { display:flex; gap:6px; align-items:center; color:var(--muted); font-size:12px; }
+  button.danger { border-color:#7a2b2b; }
+  button.danger:hover { background:#c0392b; border-color:#c0392b; color:#fff; }
+  button.busy { opacity:.6; cursor:wait; }
+  /* toast */
+  #toast { position:fixed; bottom:22px; left:50%; transform:translateX(-50%) translateY(20px);
+           background:#1f2a37; color:var(--txt); border:1px solid var(--line); border-left:4px solid var(--accent);
+           padding:10px 16px; border-radius:8px; font-size:13px; box-shadow:0 6px 20px rgba(0,0,0,.45);
+           opacity:0; pointer-events:none; transition:opacity .2s, transform .2s; z-index:50; }
+  #toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+  #toast.ok { border-left-color:var(--good); }
+  #toast.err { border-left-color:#e74c3c; }
+  #toast.info { border-left-color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐟 Fish measurement review</h1>
+  <select id="videoSel"></select>
+  <span class="hint" id="vidInfo"></span>
+</header>
+<div class="wrap">
+  <div class="side" id="frameList"></div>
+  <div class="main">
+    <div class="toolbar">
+      <button id="prevBtn">◀ Prev</button>
+      <button id="nextBtn">Next ▶</button>
+      <button id="nextProbBtn">Next problem ⚠</button>
+      <span class="readout">Length: <b id="lenPx">–</b> px <span id="lenUnit"></span></span>
+      <span class="flags" id="flagTxt"></span>
+      <span style="flex:1"></span>
+      <label class="chk"><input type="checkbox" id="showBox"> Show YOLO box</label>
+      <label class="chk"><input type="checkbox" id="showMask"> Show mask</label>
+      <label class="chk"><input type="checkbox" id="clearProb"> mark resolved</label>
+      <button id="addBtn">Add keypoints</button>
+      <button id="resetBtn">Reset</button>
+      <button class="danger" id="deleteBtn">🗑 Delete frame</button>
+      <button class="primary" id="saveBtn">Save</button>
+    </div>
+    <div class="canvas-host">
+      <canvas id="cv" width="900" height="500"></canvas>
+      <div class="hint">Drag the yellow points to correct the body line. Pink = head/tail tips. Cyan ✛ = center of mass (not editable). · Mouse wheel = zoom, drag to pan when zoomed, double-click = reset zoom.</div>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+<script>
+const API = "";
+let video=null, meta=null, frames=[], curIdx=0, rec=null;
+let img=new Image(), scale=1, keys=[], dragging=-1, dirty=false;
+let maskTinted=null, maskForName=null, maskReq=0;
+let zoom=1, panX=0, panY=0, panning=false, panLastX=0, panLastY=0;  // view transform
+const cv=document.getElementById("cv"), ctx=cv.getContext("2d");
+
+function clampPan(){
+  if(zoom<=1){ zoom=1; panX=0; panY=0; return; }
+  const minX=cv.width*(1-zoom), minY=cv.height*(1-zoom);
+  panX=Math.min(0,Math.max(minX,panX));
+  panY=Math.min(0,Math.max(minY,panY));
+}
+
+async function jget(u){ const r=await fetch(u); if(!r.ok) throw new Error(u); return r.json(); }
+
+let toastTimer=null;
+function toast(msg, kind="info", ms=2200){
+  const t=document.getElementById("toast");
+  t.textContent=msg; t.className="show "+kind;
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>{ t.className=""; }, ms);
+}
+async function withBusy(btn, label, fn){
+  const old=btn.textContent; btn.disabled=true; btn.classList.add("busy"); btn.textContent=label;
+  try { return await fn(); }
+  finally { btn.disabled=false; btn.classList.remove("busy"); btn.textContent=old; }
+}
+
+async function init(){
+  const vids=await jget(API+"/api/videos");
+  const sel=document.getElementById("videoSel");
+  sel.innerHTML = vids.map(v=>`<option>${v}</option>`).join("");
+  sel.onchange=()=>loadVideo(sel.value);
+  if(vids.length){ await loadVideo(vids[0]); }
+  else { document.getElementById("vidInfo").textContent="No videos in output/. Run measure.py first."; }
+}
+
+async function loadVideo(v){
+  video=v; meta=await jget(`${API}/api/videos/${v}`); frames=meta.frames;
+  document.getElementById("vidInfo").textContent =
+    `${frames.length} frames · ${frames.filter(f=>f.problematic).length} problematic · ${meta.unit||"px"}`;
+  renderList(); selectFrame(0);
+}
+
+function renderList(){
+  const el=document.getElementById("frameList");
+  el.innerHTML = frames.map((f,i)=>{
+    const b = f.problematic?'<span class="badge prob">⚠</span>':(f.edited?'<span class="badge edit">✓</span>':'');
+    return `<div class="frame-item ${i===curIdx?'active':''}" data-i="${i}">
+              <span class="nm">${f.name}</span>${b}</div>`;
+  }).join("");
+  el.querySelectorAll(".frame-item").forEach(d=>d.onclick=()=>selectFrame(+d.dataset.i));
+}
+
+function selectFrame(i){
+  if(dirty && !confirm("Discard unsaved changes?")) return;
+  curIdx=i; rec=frames[i]; dirty=false;
+  document.getElementById("clearProb").checked=false;
+  keys=(rec.keypoints||[]).map(p=>[p[0],p[1]]);
+  document.getElementById("flagTxt").textContent = rec.flags?("flags: "+rec.flags):"";
+  maskTinted=null; maskForName=null;   // mask belongs to a frame; reset on change
+  img=new Image();
+  img.onload=()=>{ fit(); draw(); updateLen(); if(document.getElementById("showMask").checked) loadMask(); };
+  img.src=`${API}/api/videos/${video}/frames/${rec.name}?t=${Date.now()}`;
+  renderList();
+}
+
+function fit(){
+  const maxW=Math.min(1100, document.querySelector(".canvas-host").clientWidth-32);
+  scale = img.naturalWidth>maxW ? maxW/img.naturalWidth : 1;
+  cv.width = Math.round(img.naturalWidth*scale);
+  cv.height= Math.round(img.naturalHeight*scale);
+}
+
+function draw(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.setTransform(zoom,0,0,zoom,panX,panY);   // zoom+pan around fit-space
+  ctx.drawImage(img,0,0,cv.width,cv.height);
+  // segmentation mask tint (toggleable) — only if it belongs to the current frame
+  if(document.getElementById("showMask").checked && maskTinted && rec && maskForName===rec.name){
+    ctx.drawImage(maskTinted,0,0,cv.width,cv.height);
+  }
+  const Z=1/zoom;   // keep handle/line sizes constant on screen
+  // YOLO detection box (toggleable)
+  if(document.getElementById("showBox").checked && rec && rec.bbox){
+    const b=rec.bbox;
+    ctx.strokeStyle="#ff8c42"; ctx.lineWidth=2.5*Z; ctx.setLineDash([9*Z,6*Z]);
+    ctx.strokeRect(b[0]*scale, b[1]*scale, (b[2]-b[0])*scale, (b[3]-b[1])*scale);
+    ctx.setLineDash([]);
+  }
+  // body line
+  if(keys.length>1){
+    ctx.strokeStyle="rgba(255,40,40,.9)"; ctx.lineWidth=3*Z; ctx.beginPath();
+    keys.forEach((p,i)=>{ const x=p[0]*scale,y=p[1]*scale; i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.stroke();
+  }
+  // handles
+  keys.forEach((p,i)=>{
+    const x=p[0]*scale,y=p[1]*scale, tip=(i===0||i===keys.length-1);
+    ctx.beginPath(); ctx.arc(x,y,7*Z,0,7);
+    ctx.fillStyle = tip?"#ff5cf0":"#ffd23b"; ctx.fill();
+    ctx.lineWidth=2*Z; ctx.strokeStyle="#04121f"; ctx.stroke();
+  });
+  // center of mass (not editable)
+  if(rec && rec.com_x!=null){
+    const x=rec.com_x*scale,y=rec.com_y*scale, r=10*Z;
+    ctx.strokeStyle="#28e0e0"; ctx.lineWidth=2*Z;
+    ctx.beginPath(); ctx.moveTo(x-r,y); ctx.lineTo(x+r,y); ctx.moveTo(x,y-r); ctx.lineTo(x,y+r); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x,y,5*Z,0,7); ctx.stroke();
+  }
+  ctx.setTransform(1,0,0,1,0,0);
+}
+
+function loadMask(){
+  if(!rec) return;
+  if(maskForName===rec.name && maskTinted){ draw(); return; }   // already have it
+  const name=rec.name, token=++maskReq;                          // tag this request
+  toast("Loading mask…","info",1200);
+  const m=new Image();
+  m.onload=()=>{
+    if(token!==maskReq) return;            // a newer frame was selected; ignore
+    // tint white mask -> translucent green on an offscreen canvas
+    const oc=document.createElement("canvas"); oc.width=m.naturalWidth; oc.height=m.naturalHeight;
+    const octx=oc.getContext("2d"); octx.drawImage(m,0,0);
+    const d=octx.getImageData(0,0,oc.width,oc.height), a=d.data;
+    for(let i=0;i<a.length;i+=4){
+      if(a[i]>127){ a[i]=0; a[i+1]=230; a[i+2]=0; a[i+3]=120; } else { a[i+3]=0; }
+    }
+    octx.putImageData(d,0,0);
+    maskTinted=oc; maskForName=name; draw();
+    if(rec && rec.name===name) toast("Mask shown","ok",1000);
+  };
+  m.onerror=()=>{ if(token===maskReq) toast("No mask available for this frame","err"); };
+  m.src=`${API}/api/videos/${video}/frames/${name}/mask?t=${Date.now()}`;
+}
+document.getElementById("showMask").onchange=function(){
+  if(!rec) return;
+  if(this.checked){ (maskTinted && maskForName===rec.name) ? draw() : loadMask(); }
+  else { draw(); toast("Mask hidden","info",1000); }
+};
+document.getElementById("showBox").onchange=function(){
+  draw();
+  if(this.checked && rec && !rec.bbox){ toast("No YOLO box for this frame","err"); return; }
+  toast(this.checked?"YOLO box shown":"YOLO box hidden", this.checked?"ok":"info", 1000);
+};
+
+function updateLen(){
+  let L=0; for(let i=1;i<keys.length;i++){ const a=keys[i-1],b=keys[i]; L+=Math.hypot(a[0]-b[0],a[1]-b[1]); }
+  document.getElementById("lenPx").textContent = keys.length>1? L.toFixed(0):"–";
+  const ppu=meta&&meta.px_per_unit;
+  document.getElementById("lenUnit").textContent = (ppu&&keys.length>1)? `  (${(L/ppu).toFixed(2)} ${meta.unit})`:"";
+}
+
+function canvasPx(e){   // mouse -> canvas device pixels
+  const r=cv.getBoundingClientRect();
+  return [(e.clientX-r.left)*(cv.width/r.width), (e.clientY-r.top)*(cv.height/r.height)];
+}
+function evtPt(e){      // mouse -> image coords (undo zoom+pan, then fit scale)
+  const [cx,cy]=canvasPx(e);
+  return [((cx-panX)/zoom)/scale, ((cy-panY)/zoom)/scale];
+}
+cv.addEventListener("pointerdown",e=>{
+  const [px,py]=evtPt(e); let best=-1,bd=1e9;
+  keys.forEach((p,i)=>{ const d=Math.hypot(p[0]-px,p[1]-py); if(d<bd){bd=d;best=i;} });
+  if(best>=0 && bd*scale*zoom<14){ dragging=best; cv.setPointerCapture(e.pointerId); }
+  else if(zoom>1){ panning=true; panLastX=e.clientX; panLastY=e.clientY; cv.setPointerCapture(e.pointerId); cv.style.cursor="grabbing"; }
+});
+cv.addEventListener("pointermove",e=>{
+  if(dragging>=0){ keys[dragging]=evtPt(e); dirty=true; draw(); updateLen(); return; }
+  if(panning){
+    const r=cv.getBoundingClientRect();
+    panX+=(e.clientX-panLastX)*(cv.width/r.width);
+    panY+=(e.clientY-panLastY)*(cv.height/r.height);
+    panLastX=e.clientX; panLastY=e.clientY; clampPan(); draw();
+  }
+});
+cv.addEventListener("pointerup",()=>{ dragging=-1; panning=false; cv.style.cursor=zoom>1?"grab":"default"; });
+cv.addEventListener("wheel",e=>{
+  e.preventDefault();
+  const [mx,my]=canvasPx(e);
+  const factor = e.deltaY<0 ? 1.15 : 1/1.15;
+  const nz = Math.min(8, Math.max(1, zoom*factor));
+  if(nz===zoom) return;
+  panX = mx-(mx-panX)*(nz/zoom);   // keep the point under the cursor fixed
+  panY = my-(my-panY)*(nz/zoom);
+  zoom = nz; clampPan(); draw();
+  cv.style.cursor = zoom>1?"grab":"default";
+},{passive:false});
+cv.addEventListener("dblclick",e=>{ zoom=1; panX=0; panY=0; draw(); cv.style.cursor="default"; toast("Zoom reset","info",900); });
+
+document.getElementById("prevBtn").onclick=()=>{ if(curIdx>0) selectFrame(curIdx-1); };
+document.getElementById("nextBtn").onclick=()=>{ if(curIdx<frames.length-1) selectFrame(curIdx+1); };
+document.getElementById("nextProbBtn").onclick=()=>{
+  for(let k=1;k<=frames.length;k++){ const i=(curIdx+k)%frames.length; if(frames[i].problematic){ selectFrame(i); toast("Jumped to "+frames[i].name,"info"); return; } }
+  toast("No problematic frames 🎉","ok");
+};
+document.getElementById("resetBtn").onclick=()=>{ selectFrame(curIdx); toast("Reverted to saved values","info"); };
+document.getElementById("addBtn").onclick=()=>{
+  // create a default 9-point line across the middle for frames with no keypoints
+  const W=img.naturalWidth,H=img.naturalHeight,N=9,out=[];
+  for(let i=0;i<N;i++){ const t=i/(N-1); out.push([W*(0.3+0.4*t), H*(0.3+0.4*t)]); }
+  keys=out; dirty=true; draw(); updateLen(); toast("Added "+N+" keypoints — drag to position","info");
+};
+const saveBtn=document.getElementById("saveBtn");
+saveBtn.onclick=()=>{
+  if(keys.length<2){ toast("Need at least 2 keypoints","err"); return; }
+  withBusy(saveBtn,"Saving…",async()=>{
+    const body={keypoints:keys, clear_problem:document.getElementById("clearProb").checked};
+    const r=await fetch(`${API}/api/videos/${video}/frames/${rec.name}`,
+          {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    if(!r.ok){ toast("Save failed","err"); return; }
+    const updated=await r.json(); frames[curIdx]=updated; rec=updated; dirty=false;
+    renderList(); selectFrame(curIdx);
+    toast(`Saved ✓  length ${updated.curved_length_px} px — Excel updated`,"ok");
+  }).catch(()=>toast("Save failed","err"));
+};
+const deleteBtn=document.getElementById("deleteBtn");
+deleteBtn.onclick=()=>{
+  if(!rec) return;
+  if(!confirm(`Delete frame "${rec.name}"?\nThis removes its image and its row from the Excel.`)) return;
+  withBusy(deleteBtn,"Deleting…",async()=>{
+    const r=await fetch(`${API}/api/videos/${video}/frames/${rec.name}`,{method:"DELETE"});
+    if(!r.ok){ toast("Delete failed","err"); return; }
+    const res=await r.json();
+    frames.splice(curIdx,1);
+    document.getElementById("vidInfo").textContent =
+      `${frames.length} frames · ${frames.filter(f=>f.problematic).length} problematic · ${meta.unit||"px"}`;
+    if(frames.length===0){ ctx.clearRect(0,0,cv.width,cv.height); rec=null; renderList();
+      toast("Deleted — no frames left","ok"); return; }
+    if(curIdx>=frames.length) curIdx=frames.length-1;
+    dirty=false; renderList(); selectFrame(curIdx);
+    toast(`Deleted ✓  ${res.remaining} frames left — Excel updated`,"ok");
+  }).catch(()=>toast("Delete failed","err"));
+};
+window.addEventListener("keydown",e=>{
+  if(e.key==="ArrowLeft") document.getElementById("prevBtn").click();
+  if(e.key==="ArrowRight") document.getElementById("nextBtn").click();
+  if(e.key==="s"&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); document.getElementById("saveBtn").click(); }
+});
+init();
+</script>
+</body>
+</html>

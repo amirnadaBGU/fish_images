@@ -1,0 +1,5 @@
+# Optional: YOLO detection + SAM 2 segmentation backends (needs PyTorch).
+# SAM 2 support requires ultralytics >= 8.3.
+# Install into the project venv:
+#   pip install -r requirements-yolo.txt
+ultralytics>=8.4.82
