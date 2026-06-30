@@ -59,6 +59,8 @@
   .stat-row { display:flex; justify-content:space-between; font-size:13px; padding:2px 0; border-bottom:1px solid var(--line); }
   .stat-val { color:var(--accent); font-weight:600; }
   .dash-canvas { width:100%; display:block; border-radius:4px; }
+  .tab-btn { font-size:11px; padding:2px 9px; border:1px solid var(--line); border-radius:4px; background:var(--bg2); cursor:pointer; font-family:inherit; color:var(--fg); }
+  .tab-btn.active { background:var(--accent); color:#fff; border-color:var(--accent); }
   .heat-legend { display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:6px; }
   button.active-view { background:#22425f; border-color:var(--accent); }
   /* grid view */
@@ -128,7 +130,14 @@
         </div>
         <div class="dash-col" style="flex:1;min-width:0">
           <div class="dash-card">
-            <h3>Length by position in frame</h3>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+              <h3 style="margin:0" id="heatTitle">Length by position in frame</h3>
+              <div style="display:flex;gap:4px">
+                <button class="tab-btn active" id="heatTabPos">📍 Position</button>
+                <button class="tab-btn" id="heatTabDist">📐 Distortion</button>
+                <button class="tab-btn" id="kpBtn" title="Show keypoints for each fish">🐟 Keypoints</button>
+              </div>
+            </div>
             <canvas id="heatCv" class="dash-canvas"></canvas>
             <div class="heat-legend" id="heatLegend"></div>
           </div>
@@ -633,7 +642,8 @@ function renderDashboard() {
   timelineCv.width = tlW;       timelineCv.height = 150;
 
   drawHistogram(histCv, good.map(f=>f.curved_length_px), stats);
-  drawHeatmap(heatCv, good);
+  if(heatView==='pos') drawHeatmap(heatCv, good);
+  else                 drawDistortion(heatCv, frames);
   drawTimeline(timelineCv, frames);   // all frames (incl. problematic)
 }
 
@@ -679,6 +689,7 @@ function drawHistogram(canvas, lens, stats) {
 
 let _heatDots = [];  // [{x, y, frameIdx}] in canvas coords, rebuilt each render
 let _heatSnapshot = null, _timelineSnapshot = null, _hoveredFrameName = null;
+let _heatSnapshotView = null;  // which heatView was active when snapshot was taken
 
 function _canvasPt(e) {
   const r=e.currentTarget.getBoundingClientRect();
@@ -731,13 +742,15 @@ function _applyHover(name) {
   const heatCv=document.getElementById("heatCv");
   const tlCv=document.getElementById("timelineCv");
   const hc=heatCv.getContext("2d"), tc=tlCv.getContext("2d");
-  if(_heatSnapshot) hc.putImageData(_heatSnapshot,0,0);
+  if(_heatSnapshot && _heatSnapshotView===heatView) hc.putImageData(_heatSnapshot,0,0);
+  else return;  // snapshot is stale (view switched mid-flight) — skip highlight entirely
   if(_timelineSnapshot) tc.putImageData(_timelineSnapshot,0,0);
   if(!name) return;
   const hd=_heatDots.find(d=>d.name===name);
   if(hd&&_heatSnapshot){
-    if(hd.x1!=null) _drawArrowHighlight(hc,hd.x1,hd.y1,hd.x2,hd.y2,hd.color,`${hd.len?.toFixed(0)} px`);
-    else _drawHighlight(hc,hd.x,hd.y,"#ff8c42",`${hd.len?.toFixed(0)} px`);
+    const hlabel = hd.label ?? `${hd.len?.toFixed(0)} px`;
+    if(hd.x1!=null) _drawArrowHighlight(hc,hd.x1,hd.y1,hd.x2,hd.y2,hd.color,hlabel);
+    else _drawHighlight(hc,hd.x,hd.y,"#ff8c42",hlabel);
   }
   const td=_timelineDots.find(d=>d.name===name);
   if(td&&_timelineSnapshot){
@@ -786,30 +799,86 @@ function drawHeatmap(canvas, good) {
   const pad={l:4,r:4,t:4,b:4}, pw=W-pad.l-pad.r, ph=H-pad.t-pad.b;
   const sx=f=>pad.l+(f/imgW)*pw, sy=f=>pad.t+(f/imgH)*ph;
 
+  // aspect-ratio-preserving scale for keypoint mode (letterbox image into canvas)
+  const sc=Math.min(pw/imgW, ph/imgH);
+  const kpOX=pad.l+(pw-imgW*sc)/2, kpOY=pad.t+(ph-imgH*sc)/2;
+  const skx=v=>kpOX+v*sc, sky=v=>kpOY+v*sc;
+
   pts.forEach(f=>{
     const t=(f.curved_length_px-minL)/spanL;
     const col=lenColor(t);
     const frameIdx=frames.findIndex(r=>r.name===f.name);
-    const hasTips=f.tip_tl_x!=null&&f.tip_br_x!=null;
-    if(hasTips){
-      // fixed-length arrow (14px) centered at midpoint, direction from tip_br→tip_tl
-      const fx1=sx(f.tip_br_x),fy1=sy(f.tip_br_y);
-      const fx2=sx(f.tip_tl_x),fy2=sy(f.tip_tl_y);
-      const xm=(fx1+fx2)/2, ym=(fy1+fy2)/2;
-      const flen=Math.hypot(fx2-fx1,fy2-fy1)||1;
-      const ux=(fx2-fx1)/flen, uy=(fy2-fy1)/flen;
-      const HS=9; // half-length of drawn arrow
-      const x1=xm-ux*HS, y1=ym-uy*HS, x2=xm+ux*HS, y2=ym+uy*HS;
-      _arrow(c,x1,y1,x2,y2,col,2.5);
-      _heatDots.push({x:xm,y:ym,x1,y1,x2,y2,color:col,frameIdx,name:f.name,len:f.curved_length_px});
+
+    if(showKp && f.keypoints && f.keypoints.length>=2){
+      // draw full curved fish at correct proportional position
+      const kp=f.keypoints, n=kp.length;
+      const kx=kp.map(p=>skx(p[0])), ky=kp.map(p=>sky(p[1]));
+      c.beginPath(); c.moveTo(kx[0],ky[0]);
+      for(let i=1;i<n;i++) c.lineTo(kx[i],ky[i]);
+      c.strokeStyle=col; c.lineWidth=1.2; c.globalAlpha=0.75; c.stroke(); c.globalAlpha=1;
+      for(let i=0;i<n;i++){
+        c.beginPath(); c.arc(kx[i],ky[i],1.5,0,Math.PI*2);
+        c.fillStyle=col; c.globalAlpha=0.85; c.fill(); c.globalAlpha=1;
+      }
+      // arrowhead at last kp in direction of last segment
+      const dx=kx[n-1]-kx[n-2], dy=ky[n-1]-ky[n-2], dl=Math.hypot(dx,dy)||1;
+      const ux=dx/dl, uy=dy/dl, hs=5;
+      _arrow(c,kx[n-1]-ux*hs*2,ky[n-1]-uy*hs*2,kx[n-1]+ux*hs,ky[n-1]+uy*hs,col,1.5,0.9);
+      // click target = midpoint
+      const xm=(kx[0]+kx[n-1])/2, ym=(ky[0]+ky[n-1])/2;
+      _heatDots.push({x:xm,y:ym,x1:null,color:col,frameIdx,name:f.name,len:f.curved_length_px});
     } else {
-      // fallback dot at CoM
-      const x=sx(f.com_x),y=sy(f.com_y);
-      c.beginPath(); c.arc(x,y,4,0,Math.PI*2);
-      c.fillStyle=col; c.globalAlpha=.82; c.fill(); c.globalAlpha=1;
-      _heatDots.push({x,y,x1:null,color:col,frameIdx,name:f.name,len:f.curved_length_px});
+      // arrow mode
+      const hasTips=f.tip_tl_x!=null&&f.tip_br_x!=null;
+      if(hasTips){
+        const fx1=skx(f.tip_br_x),fy1=sky(f.tip_br_y);
+        const fx2=skx(f.tip_tl_x),fy2=sky(f.tip_tl_y);
+        const xm=(fx1+fx2)/2, ym=(fy1+fy2)/2;
+        const flen=Math.hypot(fx2-fx1,fy2-fy1)||1;
+        const ux=(fx2-fx1)/flen, uy=(fy2-fy1)/flen;
+        const HS=9;
+        const x1=xm-ux*HS, y1=ym-uy*HS, x2=xm+ux*HS, y2=ym+uy*HS;
+        _arrow(c,x1,y1,x2,y2,col,2.5);
+        _heatDots.push({x:xm,y:ym,x1,y1,x2,y2,color:col,frameIdx,name:f.name,len:f.curved_length_px});
+      } else {
+        const x=skx(f.com_x),y=sky(f.com_y);
+        c.beginPath(); c.arc(x,y,4,0,Math.PI*2);
+        c.fillStyle=col; c.globalAlpha=.82; c.fill(); c.globalAlpha=1;
+        _heatDots.push({x,y,x1:null,color:col,frameIdx,name:f.name,len:f.curved_length_px});
+      }
     }
   });
+  // L₀ region ellipse (r < 0.15 from image centre)
+  if(img.naturalWidth && img.naturalHeight){
+    const fW=img.naturalWidth, fH=img.naturalHeight;
+    const halfDiag=Math.hypot(fW/2, fH/2);
+    const icx=fW/2, icy=fH/2;
+    const central=good.filter(f=>f.com_x!=null&&Math.hypot(f.com_x-icx,f.com_y-icy)/halfDiag<l0Threshold);
+    const usedL0=central.length>=1?central:good;
+    const L0=usedL0.reduce((s,f)=>s+(f.curved_length_px||0),0)/usedL0.length;
+    const ecx=skx(fW/2), ecy=sky(fH/2);
+    const erx=l0Threshold*halfDiag*sc;
+    const ery=l0Threshold*halfDiag*sc;
+    c.save();
+    c.strokeStyle="rgba(80,140,240,.7)"; c.lineWidth=1.5; c.setLineDash([5,4]);
+    c.beginPath(); c.ellipse(ecx,ecy,erx,ery,0,0,Math.PI*2); c.stroke();
+    c.setLineDash([]);
+    c.fillStyle="rgba(80,140,240,.07)";
+    c.beginPath(); c.ellipse(ecx,ecy,erx,ery,0,0,Math.PI*2); c.fill();
+    c.fillStyle="rgba(60,120,220,.85)"; c.font="bold 9px system-ui"; c.textAlign="center";
+    c.fillText("L₀ region", ecx, ecy-ery-3);
+    const lh=13;
+    c.font="9px system-ui";
+    c.fillText(`num samples = ${central.length}`, ecx, ecy-lh/2);
+    c.fillText(`L₀ = ${L0.toFixed(0)} px`,        ecx, ecy+lh/2+2);
+    // drag handle at top of ellipse
+    c.beginPath(); c.arc(ecx, ecy-ery, 5, 0, Math.PI*2);
+    c.fillStyle="#fff"; c.fill();
+    c.strokeStyle="rgba(60,120,220,.9)"; c.lineWidth=1.5; c.stroke();
+    c.restore();
+    _l0Handle={ecx,ecy,erx,ery,fW,fH,pw,ph,pl:pad.l,pt:pad.t,halfDiag};
+  }
+
   // color legend gradient bar
   const lx=pad.l, ly=H-18, lw=Math.min(180,pw), lh=8;
   const grad=c.createLinearGradient(lx,0,lx+lw,0);
@@ -820,20 +889,61 @@ function drawHeatmap(canvas, good) {
   c.textAlign="right"; c.fillText(maxL.toFixed(0)+" px",lx+lw,ly+lh+10);
   document.getElementById("heatLegend").innerHTML="";
   _heatSnapshot=canvas.getContext("2d").getImageData(0,0,canvas.width,canvas.height);
-  _hoveredFrameName=null;
+  _heatSnapshotView='pos'; _hoveredFrameName=null;
 }
 
-document.getElementById("heatCv").addEventListener("mousemove", e=>{
-  if(!_heatDots.length) return;
+function _l0DragMove(e) {
+  if(!l0Dragging || !_l0Handle) return;
+  l0DidDrag=true;
+  const heatCv=document.getElementById("heatCv");
+  const r=heatCv.getBoundingClientRect();
+  const cx=(e.clientX-r.left)*heatCv.width/r.width;
+  const cy=(e.clientY-r.top)*heatCv.height/r.height;
+  const {fW,fH,pw,ph,pl,pt,halfDiag}=_l0Handle;
+  const ix=(cx-pl)*fW/pw, iy=(cy-pt)*fH/ph;
+  l0Threshold=Math.max(0.04,Math.min(0.5,Math.hypot(ix-fW/2,iy-fH/2)/halfDiag));
+  const good=frames.filter(f=>!f.problematic&&f.curved_length_px!=null);
+  drawHeatmap(heatCv,good);
+}
+function _l0DragEnd() {
+  if(!l0Dragging) return;
+  l0Dragging=false;
+  document.removeEventListener("mousemove",_l0DragMove);
+  document.removeEventListener("mouseup",_l0DragEnd);
+}
+
+document.getElementById("heatCv").addEventListener("mousedown", e=>{
+  if(!_l0Handle || heatView!=='pos') return;
   const [cx,cy]=_canvasPt(e);
+  const {ecx,ecy,ery}=_l0Handle;
+  if(Math.hypot(cx-ecx,cy-(ecy-ery))<=12){
+    l0Dragging=true; l0DidDrag=false;
+    document.addEventListener("mousemove",_l0DragMove);
+    document.addEventListener("mouseup",_l0DragEnd);
+    e.preventDefault();
+  }
+});
+
+document.getElementById("heatCv").addEventListener("mousemove", e=>{
+  if(l0Dragging) return;
+  const [cx,cy]=_canvasPt(e);
+  // handle cursor near drag handle
+  if(_l0Handle && heatView==='pos'){
+    const {ecx,ecy,ery}=_l0Handle;
+    if(Math.hypot(cx-ecx,cy-(ecy-ery))<=12){
+      e.currentTarget.style.cursor='ns-resize'; return;
+    }
+  }
+  if(!_heatDots.length) return;
   const d=_nearestDot(_heatDots,cx,cy,14);
   e.currentTarget.style.cursor=d?"pointer":"default";
   _applyHover(d?d.name:null);
 });
-document.getElementById("heatCv").addEventListener("mouseleave", ()=>_applyHover(null));
+document.getElementById("heatCv").addEventListener("mouseleave", ()=>{ if(!l0Dragging) _applyHover(null); });
 
 // click on a heatmap dot -> navigate to that frame
 document.getElementById("heatCv").addEventListener("click", e=>{
+  if(l0DidDrag){ l0DidDrag=false; return; }
   if(!_heatDots.length) return;
   const r=e.currentTarget.getBoundingClientRect();
   const mx=e.clientX-r.left, my=e.clientY-r.top;
@@ -850,6 +960,163 @@ document.getElementById("heatCv").addEventListener("click", e=>{
     setView("review");
   }
 });
+// ── Heatmap view tabs ────────────────────────────────────────────────────────
+let heatView = 'pos';  // 'pos' | 'dist'
+let showKp = false;        // show per-fish keypoint paths on position heatmap
+let l0Threshold = 0.15;   // fraction of halfDiag used for L₀ central region
+let l0Dragging = false, l0DidDrag = false;
+let _l0Handle = null;     // {ecx,ecy,erx,ery,fW,fH,pw,ph,pl,pt,halfDiag} set by drawHeatmap
+
+function _setHeatTab(v) {
+  heatView = v;
+  document.getElementById("heatTabPos").classList.toggle("active", v==="pos");
+  document.getElementById("heatTabDist").classList.toggle("active", v==="dist");
+  document.getElementById("heatTitle").textContent =
+    v==="pos" ? "Length by position in frame" : "Distortion analysis (cos²θ vs L/L₀)";
+  if(video) renderDashboard();
+}
+document.getElementById("heatTabPos").onclick  = ()=>_setHeatTab("pos");
+document.getElementById("heatTabDist").onclick = ()=>_setHeatTab("dist");
+document.getElementById("kpBtn").onclick = ()=>{
+  showKp=!showKp;
+  document.getElementById("kpBtn").classList.toggle("active",showKp);
+  if(video && heatView==='pos') renderDashboard();
+};
+
+// ── Distortion analysis ───────────────────────────────────────────────────────
+function _rColor(r) {
+  // blue (r=0) → green (r=0.5) → red (r=1)
+  const r3 = Math.max(0, Math.min(1, r));
+  const R = Math.round(r3 < 0.5 ? 80 + r3*2*80  : 160 + (r3-0.5)*2*80);
+  const G = Math.round(r3 < 0.5 ? 100 + r3*2*100 : 200 - (r3-0.5)*2*160);
+  const B = Math.round(r3 < 0.5 ? 220 - r3*2*140 : 80);
+  return `rgb(${R},${G},${B})`;
+}
+
+function _linReg(pts) {
+  const n=pts.length; if(n<3) return null;
+  const mx=pts.reduce((s,p)=>s+p.x,0)/n, my=pts.reduce((s,p)=>s+p.y,0)/n;
+  const num=pts.reduce((s,p)=>s+(p.x-mx)*(p.y-my),0);
+  const den=pts.reduce((s,p)=>s+(p.x-mx)**2,0);
+  if(!den) return null;
+  return {slope:num/den, b:my-(num/den)*mx};
+}
+
+function computeDistortionData(allFrames) {
+  const fW=img.naturalWidth, fH=img.naturalHeight;
+  if(!fW||!fH) return null;
+  const cx=fW/2, cy=fH/2, halfDiag=Math.hypot(cx,cy);
+  const good=allFrames.filter(f=>
+    !f.problematic && f.com_x!=null && f.curved_length_px!=null &&
+    f.tip_tl_x!=null && f.tip_br_x!=null
+  );
+  const central=good.filter(f=>Math.hypot(f.com_x-cx,f.com_y-cy)/halfDiag<l0Threshold);
+  const usedForL0=central.length>=3?central:good;
+  const L0=usedForL0.reduce((s,f)=>s+f.curved_length_px,0)/usedForL0.length;
+  const centralNote=central.length>=3
+    ?`L₀=${L0.toFixed(0)} px (${central.length} central frames, r<${l0Threshold.toFixed(2)})`
+    :`⚠ No central frames — L₀=${L0.toFixed(0)} px (mean of all ${good.length})`;
+  const pts=good.map(f=>{
+    const r=Math.hypot(f.com_x-cx,f.com_y-cy)/halfDiag;
+    const fx=f.tip_tl_x-f.tip_br_x, fy=f.tip_tl_y-f.tip_br_y;
+    const rx=f.com_x-cx, ry=f.com_y-cy;
+    const fl=Math.hypot(fx,fy), rl=Math.hypot(rx,ry);
+    const cosT=(fl>0&&rl>0)?Math.abs((fx*rx+fy*ry)/(fl*rl)):0;
+    return {name:f.name, r, cos2t:cosT*cosT, Lnorm:f.curved_length_px/L0,
+            frameIdx:frames.findIndex(d=>d.name===f.name)};
+  });
+  return {pts, centralNote, nCentral:central.length};
+}
+
+function drawDistortion(canvas, allFrames) {
+  const W=canvas.width, H=canvas.height;
+  const c=canvas.getContext("2d");
+  c.fillStyle="#ffffff"; c.fillRect(0,0,W,H);
+  _heatDots=[];
+  const data=computeDistortionData(allFrames);
+  if(!data||data.pts.length<4){
+    c.fillStyle="#8b98a5"; c.font="13px system-ui"; c.textAlign="center";
+    c.fillText(img.naturalWidth?"Not enough data (need tips + CoM)":"Load a frame first",W/2,H/2);
+    _heatSnapshot=c.getImageData(0,0,W,H); _heatSnapshotView='dist'; _hoveredFrameName=null; return;
+  }
+  const {pts, centralNote, nCentral}=data;
+
+  // diverging colormap: blue (L<L₀) → white (L=L₀) → red (L>L₀)
+  const lnorms=pts.map(p=>p.Lnorm);
+  const halfSpan=Math.max(1-Math.min(...lnorms), Math.max(...lnorms)-1, 0.03);
+  function dcolor(v){
+    const t=Math.max(-1,Math.min(1,(v-1)/halfSpan));
+    if(t<=0){const f=t+1; return `rgb(${Math.round(f*220)},${Math.round(f*220)},255)`;}
+    else{const f=1-t; return `rgb(255,${Math.round(f*220)},${Math.round(f*220)})`;}
+  }
+
+  const LEGW=14, LEGLAB=26;
+  const pad={l:46,r:LEGW+LEGLAB+6,t:16,b:36};
+  const pw=W-pad.l-pad.r, ph=H-pad.t-pad.b;
+
+  const rVals=pts.map(p=>p.r), maxR=Math.max(...rVals)||1;
+  const xOf=cos2t=>pad.l+cos2t*pw;
+  const yOf=r=>pad.t+ph*(1-Math.min(r,maxR)/maxR);
+
+  // grid
+  c.strokeStyle="rgba(0,0,0,.07)"; c.lineWidth=1;
+  [0,.25,.5,.75,1].forEach(t=>{
+    c.beginPath(); c.moveTo(xOf(t),pad.t); c.lineTo(xOf(t),pad.t+ph); c.stroke();
+    const ry=pad.t+ph*(1-t);
+    c.beginPath(); c.moveTo(pad.l,ry); c.lineTo(pad.l+pw,ry); c.stroke();
+  });
+
+  // dots
+  pts.forEach(p=>{
+    const x=xOf(p.cos2t), y=yOf(p.r), col=dcolor(p.Lnorm);
+    const label=`L/L₀ ${p.Lnorm.toFixed(3)} · r=${p.r.toFixed(2)} · cos²θ=${p.cos2t.toFixed(2)}`;
+    _heatDots.push({x,y,x1:null,color:col,frameIdx:p.frameIdx,name:p.name,label});
+    c.beginPath(); c.arc(x,y,5,0,Math.PI*2);
+    c.fillStyle=col; c.globalAlpha=.88; c.fill(); c.globalAlpha=1;
+    c.strokeStyle="rgba(0,0,0,.25)"; c.lineWidth=.7; c.stroke();
+  });
+
+  // axes border
+  c.strokeStyle="rgba(0,0,0,.3)"; c.lineWidth=1;
+  c.beginPath(); c.moveTo(pad.l,pad.t); c.lineTo(pad.l,pad.t+ph); c.lineTo(pad.l+pw,pad.t+ph); c.stroke();
+
+  // X axis labels + title
+  c.fillStyle="#8b98a5"; c.font="9px system-ui"; c.textAlign="center";
+  [0,.25,.5,.75,1].forEach(t=>c.fillText(t.toFixed(2),xOf(t),pad.t+ph+11));
+  c.fillStyle="#555"; c.font="10px system-ui";
+  c.fillText("cos²θ  (0=tangential  →  1=radial)",pad.l+pw/2,H-3);
+
+  // Y axis labels + title
+  c.fillStyle="#8b98a5"; c.font="9px system-ui"; c.textAlign="right";
+  [0,.25,.5,.75,1].forEach(t=>c.fillText((t*maxR).toFixed(2),pad.l-4,pad.t+ph*(1-t)+3));
+  c.save(); c.translate(11,pad.t+ph/2); c.rotate(-Math.PI/2);
+  c.fillStyle="#555"; c.font="10px system-ui"; c.textAlign="center";
+  c.fillText("r  (dist. from center)",0,0); c.restore();
+
+  // color legend bar (vertical, right side)
+  const lx=W-LEGW-LEGLAB+2;
+  const grad=c.createLinearGradient(0,pad.t,0,pad.t+ph);
+  grad.addColorStop(0,   dcolor(1+halfSpan));  // top = red
+  grad.addColorStop(0.5, dcolor(1.0));          // middle = white
+  grad.addColorStop(1,   dcolor(1-halfSpan));  // bottom = blue
+  c.fillStyle=grad; c.fillRect(lx,pad.t,LEGW,ph);
+  c.strokeStyle="rgba(0,0,0,.2)"; c.lineWidth=.5; c.strokeRect(lx,pad.t,LEGW,ph);
+  c.fillStyle="#555"; c.font="9px system-ui"; c.textAlign="left";
+  const ll=lx+LEGW+3;
+  c.fillText((1+halfSpan).toFixed(2), ll, pad.t+5);
+  c.fillText("1.00",                  ll, pad.t+ph/2+3);
+  c.fillText((1-halfSpan).toFixed(2), ll, pad.t+ph);
+  c.save(); c.translate(lx-2,pad.t+ph/2); c.rotate(-Math.PI/2);
+  c.textAlign="center"; c.fillText("L / L₀",0,0); c.restore();
+
+  // L₀ note
+  c.fillStyle=nCentral>=3?"#8b98a5":"#c07030"; c.font="9px system-ui"; c.textAlign="left";
+  c.fillText(centralNote, pad.l, H-4);
+
+  _heatSnapshot=canvas.getContext("2d").getImageData(0,0,W,H);
+  _heatSnapshotView='dist'; _hoveredFrameName=null;
+}
+
 // ── Timeline ─────────────────────────────────────────────────────────────────
 let _timelineDots = [];  // [{x, y, frameIdx, prob}]
 let timelineMode = 'uniform';  // 'uniform' | 'real'
